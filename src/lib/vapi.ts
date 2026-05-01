@@ -10,7 +10,8 @@ export function vapiError(toolCallId: string, message: string): NextResponse {
 
 export function extractToolCall(body: Record<string, unknown>) {
   try {
-    console.log('[vapi] Body received:', JSON.stringify(body, null, 2))
+    // Log the FULL raw body so we can see exactly what Vapi sends
+    console.log('[vapi] RAW BODY:', JSON.stringify(body, null, 2))
 
     const message = (body?.message ?? body) as Record<string, unknown>
 
@@ -21,7 +22,7 @@ export function extractToolCall(body: Record<string, unknown>) {
     const toolCall = toolCalls?.[0]
 
     if (!toolCall) {
-      console.log('[vapi] No tool call found')
+      console.log('[vapi] No tool call found. Message keys:', Object.keys(message))
       return null
     }
 
@@ -36,27 +37,54 @@ export function extractToolCall(body: Record<string, unknown>) {
       args = rawArgs as Record<string, string>
     }
 
-    const call = (message?.call ?? body?.call) as Record<string, unknown> | undefined
+    // Extract call object — try multiple locations
+    const call = (
+      message?.call ?? body?.call
+    ) as Record<string, unknown> | undefined
+
+    console.log('[vapi] call object keys:', Object.keys(call || {}))
+    console.log('[vapi] full call object:', JSON.stringify(call, null, 2))
+
+    // Extract clinic_id from metadata
     const metadata = call?.metadata as Record<string, string> | undefined
     const clinicId = metadata?.clinic_id ?? null
+    console.log('[vapi] clinicId from metadata:', clinicId)
 
-const phoneNumberObj = (
-  call?.phoneNumber ?? call?.phone_number
-) as Record<string, unknown> | undefined
+    // Extract phone number — try every possible location
+    const phoneNumberObj = (
+      call?.phoneNumber ??
+      call?.phone_number ??
+      call?.to
+    ) as Record<string, unknown> | string | undefined
 
-const toNumber = (
-  phoneNumberObj?.number ??
-  phoneNumberObj?.phoneNumber ??
-  call?.to ??
-  (body?.call as Record<string, unknown>)?.phoneNumber?.number ??
-  null
-) as string | null ?? null
-    
-console.log('[vapi] toNumber extracted:', toNumber)
-console.log('[vapi] clinicId extracted:', clinicId)
-console.log('[vapi] call keys:', Object.keys(call || {}))
+    let toNumber: string | null = null
 
-const result = {
+    if (typeof phoneNumberObj === 'string') {
+      toNumber = phoneNumberObj
+    } else if (typeof phoneNumberObj === 'object' && phoneNumberObj !== null) {
+      toNumber = (
+        (phoneNumberObj as Record<string, unknown>).number ??
+        (phoneNumberObj as Record<string, unknown>).phoneNumber ??
+        null
+      ) as string | null
+    }
+
+    // Also try direct call.to
+    if (!toNumber && typeof call?.to === 'string') {
+      toNumber = call.to as string
+    }
+
+    // Also check message level
+    if (!toNumber) {
+      const msgPhoneObj = message?.phoneNumber as Record<string, unknown> | undefined
+      if (msgPhoneObj?.number) {
+        toNumber = msgPhoneObj.number as string
+      }
+    }
+
+    console.log('[vapi] toNumber extracted:', toNumber)
+
+    const result = {
       toolCallId: String(toolCall.id ?? 'unknown'),
       toolName:   String(fn?.name ?? ''),
       args,
@@ -64,7 +92,7 @@ const result = {
       toNumber,
     }
 
-    console.log('[vapi] Extracted:', result)
+    console.log('[vapi] Final extracted result:', JSON.stringify(result, null, 2))
     return result
   } catch (err) {
     console.error('[vapi] extractToolCall error:', err)
@@ -152,7 +180,6 @@ export async function cloneVapiAssistant(params: {
     if (!createRes.ok) return null
 
     const newAssistant = await createRes.json() as { id: string }
-    console.log('[vapi] Assistant cloned:', newAssistant.id)
     return newAssistant.id
   } catch (err) {
     console.error('[vapi] cloneVapiAssistant error:', err)
