@@ -58,27 +58,34 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       )
     }
 
-    const { error: bookingError } = await supabase.from('bookings').insert({
-      clinic_id:      clinic.id,
-      patient_name:   patientName,
-      phone,
-      service,
-      date,
-      time,
-      status:         'Confirmed',
-      is_new_patient: isNewPatient,
-      booked_by:      'pearly',
-      notes,
-      created_at:     new Date().toISOString(),
-      updated_at:     new Date().toISOString(),
-    })
+    // Insert booking with 8 second timeout
+    const { error: bookingError } = await Promise.race([
+      supabase.from('bookings').insert({
+        clinic_id:      clinic.id,
+        patient_name:   patientName,
+        phone,
+        service,
+        date,
+        time,
+        status:         'Confirmed',
+        is_new_patient: isNewPatient,
+        booked_by:      'pearly',
+        notes,
+        created_at:     new Date().toISOString(),
+        updated_at:     new Date().toISOString(),
+      }),
+      new Promise<{ error: Error }>((resolve) =>
+        setTimeout(() => resolve({ error: new Error('Insert timed out') }), 8000)
+      ),
+    ]) as { error: Error | null }
 
     if (bookingError) {
       console.error('[book] Insert error:', bookingError.message)
       return vapiError(toolCallId, 'I am having trouble completing that booking. Please call us directly.')
     }
 
-    await supabase.from('patients').upsert(
+    // Upsert patient record — fire and forget
+    const patientUpsert = supabase.from('patients').upsert(
       {
         clinic_id:    clinic.id,
         patient_name: patientName,
@@ -87,11 +94,22 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       },
       { onConflict: 'clinic_id,phone' }
     )
+    Promise.resolve(patientUpsert).catch((err: unknown) => {
+      console.error('[book] Patient upsert error:', err)
+    })
 
+    // Send SMS — fire and forget, never block the response
     const clinicPhone = clinic.twilio_phone || clinic.owner_phone || ''
-    await sendSMS(phone, smsConfirmation(patientName, service, date, time, clinic.name, clinicPhone))
+    sendSMS(phone, smsConfirmation(patientName, service, date, time, clinic.name, clinicPhone))
+      .then((sent) => {
+        console.log('[book] SMS sent:', sent)
+      })
+      .catch((err: unknown) => {
+        console.error('[book] SMS error:', err)
+      })
 
-    console.log(`[book] Success — ${patientName} booked ${service} on ${date} at ${clinic.name}`)
+    // Return success immediately — do not wait for SMS or patient upsert
+    console.log(`[book] Booking saved — ${patientName} ${service} ${date} at ${clinic.name}`)
 
     return vapiSuccess(
       toolCallId,
