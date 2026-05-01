@@ -40,17 +40,23 @@ export function extractToolCall(body: Record<string, unknown>) {
     const metadata = call?.metadata as Record<string, string> | undefined
     const clinicId = metadata?.clinic_id ?? null
 
-    const phoneNumberObj = (
-      call?.phoneNumber ?? call?.phone_number
-    ) as Record<string, unknown> | undefined
+const phoneNumberObj = (
+  call?.phoneNumber ?? call?.phone_number
+) as Record<string, unknown> | undefined
 
-    const toNumber = (
-      phoneNumberObj?.number ??
-      phoneNumberObj?.phoneNumber ??
-      call?.to
-    ) as string | null ?? null
+const toNumber = (
+  phoneNumberObj?.number ??
+  phoneNumberObj?.phoneNumber ??
+  call?.to ??
+  (body?.call as Record<string, unknown>)?.phoneNumber?.number ??
+  null
+) as string | null ?? null
+    
+console.log('[vapi] toNumber extracted:', toNumber)
+console.log('[vapi] clinicId extracted:', clinicId)
+console.log('[vapi] call keys:', Object.keys(call || {}))
 
-    const result = {
+const result = {
       toolCallId: String(toolCall.id ?? 'unknown'),
       toolName:   String(fn?.name ?? ''),
       args,
