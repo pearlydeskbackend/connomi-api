@@ -1,15 +1,14 @@
 import { createClient } from '@supabase/supabase-js'
 
-export const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_KEY!,
-  {
-    auth: {
-      persistSession: false,
-      autoRefreshToken: false,
-    },
-  }
-)
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL ?? ''
+const supabaseKey = process.env.SUPABASE_SERVICE_KEY ?? ''
+
+export const supabase = createClient(supabaseUrl, supabaseKey, {
+  auth: {
+    persistSession: false,
+    autoRefreshToken: false,
+  },
+})
 
 export type Clinic = {
   id: string

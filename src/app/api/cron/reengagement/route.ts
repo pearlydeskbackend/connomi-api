@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
+
+export const dynamic = 'force-dynamic'
 import { supabase } from '@/lib/supabase'
 import { triggerVapiCall } from '@/lib/vapi'
 import { isWithinCallingHours, nextCallingWindow } from '@/lib/schedule'

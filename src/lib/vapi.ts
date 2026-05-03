@@ -10,7 +10,6 @@ export function vapiError(toolCallId: string, message: string): NextResponse {
 
 export function extractToolCall(body: Record<string, unknown>) {
   try {
-    // Log the FULL raw body so we can see exactly what Vapi sends
     console.log('[vapi] RAW BODY:', JSON.stringify(body, null, 2))
 
     const message = (body?.message ?? body) as Record<string, unknown>
@@ -37,20 +36,15 @@ export function extractToolCall(body: Record<string, unknown>) {
       args = rawArgs as Record<string, string>
     }
 
-    // Extract call object — try multiple locations
     const call = (
       message?.call ?? body?.call
     ) as Record<string, unknown> | undefined
 
     console.log('[vapi] call object keys:', Object.keys(call || {}))
-    console.log('[vapi] full call object:', JSON.stringify(call, null, 2))
 
-    // Extract clinic_id from metadata
     const metadata = call?.metadata as Record<string, string> | undefined
     const clinicId = metadata?.clinic_id ?? null
-    console.log('[vapi] clinicId from metadata:', clinicId)
 
-    // Extract phone number — try every possible location
     const phoneNumberObj = (
       call?.phoneNumber ??
       call?.phone_number ??
@@ -69,12 +63,10 @@ export function extractToolCall(body: Record<string, unknown>) {
       ) as string | null
     }
 
-    // Also try direct call.to
     if (!toNumber && typeof call?.to === 'string') {
       toNumber = call.to as string
     }
 
-    // Also check message level
     if (!toNumber) {
       const msgPhoneObj = message?.phoneNumber as Record<string, unknown> | undefined
       if (msgPhoneObj?.number) {

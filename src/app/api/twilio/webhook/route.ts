@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
+
+export const dynamic = 'force-dynamic'
 import { supabase } from '@/lib/supabase'
 import { getClinicByPhone } from '@/lib/clinic'
 import { sendSMS, smsCancellation, smsSmsReply } from '@/lib/twilio'
