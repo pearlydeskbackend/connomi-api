@@ -100,18 +100,23 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       console.error('[book] Patient upsert error:', err)
     })
 
-    // Send SMS — fire and forget, never block the response
+    // Send SMS — new patients get confirmation + intake checklist
+    // Returning patients get short confirmation only
+    // Fire and forget — never block the response
     const clinicPhone = clinic.twilio_phone || clinic.owner_phone || ''
-    sendSMS(phone, smsConfirmation(patientName, service, date, time, clinic.name, clinicPhone))
+    sendSMS(
+      phone,
+      smsConfirmation(patientName, service, date, time, clinic.name, clinicPhone, isNewPatient)
+    )
       .then((sent) => {
-        console.log('[book] SMS sent:', sent)
+        console.log(`[book] SMS sent (new patient: ${isNewPatient}):`, sent)
       })
       .catch((err: unknown) => {
         console.error('[book] SMS error:', err)
       })
 
-    // Return success immediately — do not wait for SMS or patient upsert
-    console.log(`[book] Booking saved — ${patientName} ${service} ${date} at ${clinic.name}`)
+    // Return success immediately
+    console.log(`[book] Booking saved — ${patientName} ${service} ${date} at ${clinic.name} (new: ${isNewPatient})`)
 
     return vapiSuccess(
       toolCallId,
