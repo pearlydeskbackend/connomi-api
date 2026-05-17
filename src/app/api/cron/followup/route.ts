@@ -49,9 +49,6 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   try {
     const now = new Date().toISOString()
 
-    // Find appointments that happened 48 hours ago
-    // Status must be Confirmed or Patient Confirmed — not Cancelled
-    // followup_sent_at must be null — not already followed up
     const fortyEightHoursAgo = new Date(Date.now() - 48 * 60 * 60 * 1000)
     const sixtyHoursAgo      = new Date(Date.now() - 60 * 60 * 60 * 1000)
 
@@ -104,15 +101,16 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
         continue
       }
 
-      const clinicPhone    = clinic.twilio_phone || clinic.owner_phone || ''
-      const followupType   = getFollowupType(appt.service)
+      const clinicPhone  = clinic.twilio_phone || clinic.owner_phone || ''
+      const followupType = getFollowupType(appt.service)
 
       console.log(`[followup] ${appt.patient_name} — ${appt.service} — type: ${followupType}`)
 
       let sent = false
 
       if (followupType === 'call' && assistantId && phoneNumberId) {
-        // High value procedure — personal Pearly call
+        console.log(`[followup] Triggering call — callType: followup — service: ${appt.service}`)
+
         sent = await triggerVapiCall({
           assistantId,
           phoneNumberId,
@@ -132,6 +130,8 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
         if (sent) {
           calls++
           console.log(`[followup] Call triggered for ${appt.patient_name} — ${appt.service}`)
+        } else {
+          console.error(`[followup] Call failed for ${appt.patient_name}`)
         }
 
       } else {
@@ -150,8 +150,6 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
         }
       }
 
-      // Mark as followed up regardless of send result
-      // to prevent double sending
       if (sent) {
         await supabase
           .from('bookings')
