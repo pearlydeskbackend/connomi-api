@@ -10,7 +10,8 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  if (!isWithinCallingHours()) {
+  const force = req.nextUrl.searchParams.get('force') === 'true'
+  if (!isWithinCallingHours(force)) {
     return NextResponse.json({ success: true, skipped: true, reason: nextCallingWindow() })
   }
 
