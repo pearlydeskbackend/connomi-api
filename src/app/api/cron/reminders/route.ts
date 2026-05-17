@@ -10,7 +10,8 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  if (!isWithinCallingHours()) {
+  const force = req.nextUrl.searchParams.get('force') === 'true'
+  if (!isWithinCallingHours(force)) {
     return NextResponse.json({ success: true, skipped: true, reason: nextCallingWindow() })
   }
 
@@ -33,7 +34,10 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       const clinic = appt.clinics as { name: string; owner_phone: string | null; twilio_phone: string | null } | null
       if (!clinic) continue
       const clinicPhone = clinic.twilio_phone || clinic.owner_phone || ''
-      const ok = await sendSMS(appt.phone, smsReminder(appt.patient_name, appt.service, appt.date, appt.time, clinic.name, clinicPhone))
+      const ok = await sendSMS(
+        appt.phone,
+        smsReminder(appt.patient_name, appt.service, appt.date, appt.time, clinic.name, clinicPhone)
+      )
       if (ok) {
         await supabase.from('bookings').update({ reminder_sent: new Date().toISOString() }).eq('id', appt.id)
         sent++
