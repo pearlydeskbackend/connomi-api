@@ -10,6 +10,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   }
 
   try {
+    const force = req.nextUrl.searchParams.get('force') === 'true'
     const today          = new Date().toISOString().split('T')[0]
     const twelveHoursAgo = new Date(Date.now() - 12 * 3600000).toISOString()
     const sixMonthsAgo   = new Date(Date.now() - 180 * 86400000).toISOString().split('T')[0]
