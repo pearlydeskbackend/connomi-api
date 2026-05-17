@@ -20,10 +20,13 @@ const NO_ANSWER_REASONS = [
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
   try {
-    const body    = await req.json() as Record<string, unknown>
+    const body = await req.json() as Record<string, unknown>
+    console.log('[end-of-call] RAW BODY:', JSON.stringify(body, null, 2))
+
     const message = body?.message as Record<string, unknown> | undefined
 
     if (message?.type !== 'end-of-call-report') {
+      console.log('[end-of-call] Not an end-of-call-report — type was:', message?.type)
       return NextResponse.json({ received: true })
     }
 
@@ -43,6 +46,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     const summary = analysis?.summary as string || ''
 
     console.log(`[end-of-call] endedReason: ${endedReason} assistantId: ${assistantId} customer: ${customerPhone}`)
+    console.log(`[end-of-call] isRecallCall check — assistantId: ${assistantId} VAPI_RECALL_ASSISTANT_ID: ${process.env.VAPI_RECALL_ASSISTANT_ID}`)
 
     // Log call to Supabase
     await supabase.from('call_logs').insert({
@@ -78,6 +82,8 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       endedReason.toLowerCase().includes(r.toLowerCase())
     )
 
+    console.log(`[end-of-call] isRecallCall: ${isRecallCall} patientDidNotAnswer: ${patientDidNotAnswer}`)
+
     if (isRecallCall && patientDidNotAnswer && customerPhone && clinic) {
       console.log(`[end-of-call] Recall call not answered (${endedReason}) — sending SMS to ${customerPhone}`)
 
@@ -92,7 +98,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         .single()
 
       if (patient) {
-        const step = patient.recall_sequence_step ?? 0
+        const step       = patient.recall_sequence_step ?? 0
         const isLastStep = step >= 2
 
         if (isLastStep) {
@@ -108,6 +114,8 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
           )
           console.log(`[end-of-call] Recall follow-up SMS sent to ${patient.patient_name} (step ${step + 1})`)
         }
+      } else {
+        console.log(`[end-of-call] No patient found for ${customerPhone} in clinic ${clinic.id}`)
       }
     }
 
