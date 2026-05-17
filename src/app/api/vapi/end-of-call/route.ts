@@ -9,10 +9,13 @@ import { sendSMS, smsRecallFollowUp, smsRecallFinal } from '@/lib/twilio'
 const NO_ANSWER_REASONS = [
   'voicemail',
   'no-answer',
+  'no_answer',
   'busy',
   'failed',
   'machine-detected',
   'machine-start-of-speech-detected',
+  'customer-did-not-answer',
+  'customer_did_not_answer',
 ]
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
