@@ -100,6 +100,8 @@ export async function triggerVapiCall(params: {
   variables?: Record<string, string>
 }): Promise<boolean> {
   try {
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://pearlydesk-api.vercel.app'
+
     const response = await fetch('https://api.vapi.ai/call', {
       method: 'POST',
       headers: {
@@ -110,6 +112,8 @@ export async function triggerVapiCall(params: {
         assistantId:   params.assistantId,
         phoneNumberId: params.phoneNumberId,
         customer: { number: params.customerPhone, name: params.customerName },
+        // Explicitly set server URL so end-of-call webhook always fires
+        serverUrl: `${appUrl}/api/vapi/end-of-call`,
         assistantOverrides: {
           variableValues: {
             patientName: params.customerName,
