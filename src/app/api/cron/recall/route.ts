@@ -1,182 +1,78 @@
-import { NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 
-export function vapiSuccess(toolCallId: string, message: string): NextResponse {
-  return NextResponse.json({ results: [{ toolCallId, result: message }] })
-}
+export const dynamic = 'force-dynamic'
+import { supabase } from '@/lib/supabase'
+import { triggerVapiCall } from '@/lib/vapi'
+import { isWithinCallingHours, nextCallingWindow, MAX_CALL_ATTEMPTS } from '@/lib/schedule'
 
-export function vapiError(toolCallId: string, message: string): NextResponse {
-  return NextResponse.json({ results: [{ toolCallId, result: message }] })
-}
-
-export function extractToolCall(body: Record<string, unknown>) {
-  try {
-    console.log('[vapi] RAW BODY:', JSON.stringify(body, null, 2))
-
-    const message = (body?.message ?? body) as Record<string, unknown>
-
-    const toolCalls = (
-      message?.toolCalls ?? message?.tool_calls
-    ) as Array<Record<string, unknown>> | undefined
-
-    const toolCall = toolCalls?.[0]
-
-    if (!toolCall) {
-      console.log('[vapi] No tool call found. Message keys:', Object.keys(message))
-      return null
-    }
-
-    const fn = (toolCall.function ?? toolCall.fn) as Record<string, unknown> | undefined
-
-    let args: Record<string, string> = {}
-    const rawArgs = fn?.arguments ?? fn?.args
-
-    if (typeof rawArgs === 'string') {
-      try { args = JSON.parse(rawArgs) } catch { args = {} }
-    } else if (typeof rawArgs === 'object' && rawArgs !== null) {
-      args = rawArgs as Record<string, string>
-    }
-
-    const call = (
-      message?.call ?? body?.call
-    ) as Record<string, unknown> | undefined
-
-    console.log('[vapi] call object keys:', Object.keys(call || {}))
-
-    const metadata = call?.metadata as Record<string, string> | undefined
-    const clinicId = metadata?.clinic_id ?? null
-
-    const phoneNumberObj = (
-      call?.phoneNumber ??
-      call?.phone_number ??
-      call?.to
-    ) as Record<string, unknown> | string | undefined
-
-    let toNumber: string | null = null
-
-    if (typeof phoneNumberObj === 'string') {
-      toNumber = phoneNumberObj
-    } else if (typeof phoneNumberObj === 'object' && phoneNumberObj !== null) {
-      toNumber = (
-        (phoneNumberObj as Record<string, unknown>).number ??
-        (phoneNumberObj as Record<string, unknown>).phoneNumber ??
-        null
-      ) as string | null
-    }
-
-    if (!toNumber && typeof call?.to === 'string') {
-      toNumber = call.to as string
-    }
-
-    if (!toNumber) {
-      const msgPhoneObj = message?.phoneNumber as Record<string, unknown> | undefined
-      if (msgPhoneObj?.number) {
-        toNumber = msgPhoneObj.number as string
-      }
-    }
-
-    console.log('[vapi] toNumber extracted:', toNumber)
-
-    const result = {
-      toolCallId: String(toolCall.id ?? 'unknown'),
-      toolName:   String(fn?.name ?? ''),
-      args,
-      clinicId,
-      toNumber,
-    }
-
-    console.log('[vapi] Final extracted result:', JSON.stringify(result, null, 2))
-    return result
-  } catch (err) {
-    console.error('[vapi] extractToolCall error:', err)
-    return null
+export async function GET(req: NextRequest): Promise<NextResponse> {
+  if (req.headers.get('x-cron-secret') !== process.env.CRON_SECRET) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
-}
 
-export async function triggerVapiCall(params: {
-  assistantId: string
-  phoneNumberId: string
-  customerPhone: string
-  customerName: string
-  variables?: Record<string, string>
-}): Promise<boolean> {
+  const force = req.nextUrl.searchParams.get('force') === 'true'
+  if (!isWithinCallingHours(force)) {
+    return NextResponse.json({ success: true, skipped: true, reason: nextCallingWindow() })
+  }
+
   try {
-    const response = await fetch('https://api.vapi.ai/call/phone', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${process.env.VAPI_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        assistantId:   params.assistantId,
-        phoneNumberId: params.phoneNumberId,
-        customer: { number: params.customerPhone, name: params.customerName },
-        assistantOverrides: {
-          variableValues: {
-            patientName: params.customerName,
-            ...(params.variables || {}),
-          },
+    const sixMonthsAgo       = new Date()
+    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6)
+    const cutoffDate         = sixMonthsAgo.toISOString().split('T')[0]
+    const twentyFourHoursAgo = new Date(Date.now() - 24 * 3600000).toISOString()
+    const assistantId        = process.env.VAPI_RECALL_ASSISTANT_ID
+    const phoneNumberId      = process.env.VAPI_PHONE_NUMBER_ID
+
+    if (!assistantId || !phoneNumberId) {
+      return NextResponse.json({ error: 'VAPI_RECALL_ASSISTANT_ID not set' }, { status: 500 })
+    }
+
+    const { data: patients } = await supabase
+      .from('patients')
+      .select('*, clinics(id, name, owner_phone, twilio_phone, active)')
+      .lt('last_cleaning_date', cutoffDate)
+      .lt('recall_attempts', MAX_CALL_ATTEMPTS)
+      .or(`recall_called_at.is.null,recall_called_at.lt.${twentyFourHoursAgo}`)
+      .limit(20)
+
+    if (!patients?.length) return NextResponse.json({ success: true, called: 0 })
+
+    let called = 0
+    for (const patient of patients) {
+      const clinic = patient.clinics as {
+        id: string; name: string
+        owner_phone: string | null
+        twilio_phone: string | null
+        active: boolean
+      } | null
+      if (!clinic?.active) continue
+
+      const ok = await triggerVapiCall({
+        assistantId,
+        phoneNumberId,
+        customerPhone: patient.phone,
+        customerName:  patient.patient_name,
+        variables: {
+          patientName:      patient.patient_name,
+          lastCleaningDate: patient.last_cleaning_date || 'a while ago',
+          clinicName:       clinic.name,
+          clinicPhone:      clinic.twilio_phone || clinic.owner_phone || '',
         },
-      }),
-    })
-    if (!response.ok) {
-      const errorText = await response.text()
-      console.error('[vapi] Call failed:', errorText)
-      return false
+      })
+
+      if (ok) {
+        await supabase.from('patients').update({
+          recall_called_at: new Date().toISOString(),
+          recall_attempts:  (patient.recall_attempts || 0) + 1,
+        }).eq('id', patient.id)
+        called++
+      }
+      await new Promise(r => setTimeout(r, 2000))
     }
-    console.log('[vapi] Outbound call triggered successfully')
-    return true
+
+    return NextResponse.json({ success: true, called, total: patients.length })
   } catch (err) {
-    console.error('[vapi] triggerVapiCall error:', err)
-    return false
-  }
-}
-
-export async function cloneVapiAssistant(params: {
-  templateAssistantId: string
-  clinicName: string
-  clinicPhone: string
-  clinicHours: string
-  clinicDentists: string
-  clinicAddress: string
-}): Promise<string | null> {
-  try {
-    const apiKey = process.env.VAPI_API_KEY
-    if (!apiKey) return null
-
-    const getRes = await fetch(`https://api.vapi.ai/assistant/${params.templateAssistantId}`, {
-      headers: { Authorization: `Bearer ${apiKey}` },
-    })
-    if (!getRes.ok) return null
-
-    const template  = await getRes.json() as Record<string, unknown>
-    const modelData = template.model as Record<string, unknown> | undefined
-    const messages  = modelData?.messages as Array<Record<string, unknown>> | undefined
-    const systemPrompt = String(messages?.[0]?.content || '')
-      .replace(/\{\{clinicName\}\}/g,     params.clinicName)
-      .replace(/\{\{clinicPhone\}\}/g,    params.clinicPhone)
-      .replace(/\{\{clinicHours\}\}/g,    params.clinicHours)
-      .replace(/\{\{clinicDentists\}\}/g, params.clinicDentists)
-      .replace(/\{\{clinicAddress\}\}/g,  params.clinicAddress)
-
-    const { id: _a, createdAt: _b, updatedAt: _c, orgId: _d, ...rest } =
-      template as Record<string, unknown>
-    void _a; void _b; void _c; void _d
-
-    const createRes = await fetch('https://api.vapi.ai/assistant', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ...rest,
-        name: `Pearly — ${params.clinicName}`,
-        model: { ...modelData, messages: [{ role: 'system', content: systemPrompt }] },
-      }),
-    })
-    if (!createRes.ok) return null
-
-    const newAssistant = await createRes.json() as { id: string }
-    return newAssistant.id
-  } catch (err) {
-    console.error('[vapi] cloneVapiAssistant error:', err)
-    return null
+    console.error('[recall] Error:', err)
+    return NextResponse.json({ error: 'Internal error' }, { status: 500 })
   }
 }
