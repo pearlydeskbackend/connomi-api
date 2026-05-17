@@ -20,24 +20,37 @@ const NO_ANSWER_REASONS = [
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
   try {
-    const body = await req.json() as Record<string, unknown>
-    console.log('[end-of-call] RAW BODY:', JSON.stringify(body, null, 2))
-
-    const message = body?.message as Record<string, unknown> | undefined
-
-    if (message?.type !== 'end-of-call-report') {
-      console.log('[end-of-call] Not an end-of-call-report — type was:', message?.type)
+    let body: Record<string, unknown> = {}
+    try {
+      body = await req.json() as Record<string, unknown>
+    } catch (parseErr) {
+      console.error('[end-of-call] Failed to parse JSON body:', parseErr)
       return NextResponse.json({ received: true })
     }
 
-    const analysis       = message.analysis as Record<string, unknown> | undefined
+    console.log('[end-of-call] RAW BODY:', JSON.stringify(body, null, 2))
+
+    // Vapi can send the event at top level or nested under message
+    const message = (
+      body?.message ?? body
+    ) as Record<string, unknown> | undefined
+
+    const eventType = (message?.type ?? body?.type) as string || ''
+    console.log('[end-of-call] eventType:', eventType)
+
+    if (eventType !== 'end-of-call-report') {
+      console.log('[end-of-call] Not an end-of-call-report — type was:', eventType)
+      return NextResponse.json({ received: true })
+    }
+
+    const analysis       = message?.analysis as Record<string, unknown> | undefined
     const structuredData = analysis?.structuredData as Record<string, string> | undefined
-    const call           = message.call as Record<string, unknown> | undefined
+    const call           = message?.call as Record<string, unknown> | undefined
     const metadata       = call?.metadata as Record<string, string> | undefined
     const clinicId       = metadata?.clinic_id || null
     const phoneObj       = call?.phoneNumber as Record<string, unknown> | undefined
     const toNumber       = phoneObj?.number as string | null || null
-    const endedReason    = message.endedReason as string || 'unknown'
+    const endedReason    = (message?.endedReason ?? body?.endedReason) as string || 'unknown'
     const assistantId    = call?.assistantId as string || ''
     const customerPhone  = (call?.customer as Record<string, unknown>)?.number as string || ''
 
@@ -46,21 +59,22 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     const summary = analysis?.summary as string || ''
 
     console.log(`[end-of-call] endedReason: ${endedReason} assistantId: ${assistantId} customer: ${customerPhone}`)
-    console.log(`[end-of-call] isRecallCall check — assistantId: ${assistantId} VAPI_RECALL_ASSISTANT_ID: ${process.env.VAPI_RECALL_ASSISTANT_ID}`)
+    console.log(`[end-of-call] VAPI_RECALL_ASSISTANT_ID: ${process.env.VAPI_RECALL_ASSISTANT_ID}`)
+    console.log(`[end-of-call] VAPI_REENGAGEMENT_ASSISTANT_ID: ${process.env.VAPI_REENGAGEMENT_ASSISTANT_ID}`)
 
     // Log call to Supabase
     await supabase.from('call_logs').insert({
       clinic_id:          clinic?.id || null,
-      call_id:            message.id as string || null,
-      duration_seconds:   (message.durationSeconds as number) || 0,
+      call_id:            (message?.id ?? body?.id) as string || null,
+      duration_seconds:   (message?.durationSeconds as number) || 0,
       outcome,
       sentiment:          structuredData?.patientSentiment || 'neutral',
       confidence:         structuredData?.pearlyConfidence || 'medium',
       summary,
       success_evaluation: String(analysis?.successEvaluation || ''),
       ended_reason:       endedReason,
-      cost_usd:           (message.cost as number) || 0,
-      transcript:         message.transcript as string || '',
+      cost_usd:           (message?.cost as number) || 0,
+      transcript:         message?.transcript as string || '',
       created_at:         new Date().toISOString(),
     })
 
@@ -75,8 +89,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     // ── RECALL SMS FOLLOW-UP ─────────────────────────────────────
     // If this was a recall or reengagement call and patient did not answer
     // send the follow-up SMS now
-    const isRecallCall = assistantId === process.env.VAPI_RECALL_ASSISTANT_ID ||
-                         assistantId === process.env.VAPI_REENGAGEMENT_ASSISTANT_ID
+    const isRecallCall =
+      assistantId === process.env.VAPI_RECALL_ASSISTANT_ID ||
+      assistantId === process.env.VAPI_REENGAGEMENT_ASSISTANT_ID
 
     const patientDidNotAnswer = NO_ANSWER_REASONS.some(r =>
       endedReason.toLowerCase().includes(r.toLowerCase())
