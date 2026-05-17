@@ -194,3 +194,12 @@ export function smsRecallFinal(
 ): string {
   return `Hi ${name}, we miss you at ${clinicName}! It has been a while since your last cleaning. When you are ready, call us at ${clinicPhone} — we are always happy to see you. Reply STOP to opt out.`
 }
+
+export function smsFollowupLight(
+  name: string,
+  service: string,
+  clinicName: string,
+  clinicPhone: string
+): string {
+  return `Hi ${name}, hope you are feeling great after your ${service} at ${clinicName}! Any questions or concerns? Call us at ${clinicPhone} — Dr. Do and the team are always happy to help.`
+}
