@@ -4,7 +4,7 @@ export const dynamic = 'force-dynamic'
 import { supabase } from '@/lib/supabase'
 import { resolveClinic } from '@/lib/clinic'
 import { sendSMS, smsCancellation } from '@/lib/twilio'
-import { vapiSuccess, vapiError, extractToolCall, triggerVapiCall } from '@/lib/vapi'
+import { vapiSuccess, vapiError, extractToolCall } from '@/lib/vapi'
 import { formatPhone } from '@/lib/phone'
 import { CancelSchema } from '@/lib/validators'
 
@@ -46,7 +46,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       .eq('clinic_id', clinic.id)
       .eq('phone', phone)
       .in('status', ['Confirmed', 'Checked In'])
-      .order('date', { ascending: false })
+      .order('date', { ascending: true })
       .limit(1)
       .single()
 
@@ -54,6 +54,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       return vapiError(toolCallId, 'I could not find a confirmed booking under that number. Could you double check or call us directly?')
     }
 
+    // Cancel the booking
     await supabase.from('bookings').update({
       status:       'Cancelled',
       cancelled_at: new Date().toISOString(),
@@ -61,49 +62,68 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     }).eq('id', booking.id)
 
     const clinicPhone = clinic.twilio_phone || clinic.owner_phone || ''
-    await sendSMS(phone, smsCancellation(patientName || booking.patient_name, booking.service, booking.date, booking.time, clinic.name, clinicPhone))
 
-    // Fill slot from waitlist instantly
-    const { data: nextOnWaitlist } = await supabase
-      .from('waitlist')
-      .select('*')
-      .eq('clinic_id', clinic.id)
-      .eq('status', 'waiting')
-      .lt('call_attempts', 3)
-      .order('added_at', { ascending: true })
-      .limit(1)
-      .single()
+    // Send cancellation SMS — fire and forget
+    sendSMS(phone, smsCancellation(
+      patientName || booking.patient_name,
+      booking.service, booking.date, booking.time,
+      clinic.name, clinicPhone
+    )).catch(err => console.error('[cancel] SMS error:', err))
 
-    if (nextOnWaitlist) {
-      await supabase.from('waitlist').update({
-        status:        'called',
-        called_at:     new Date().toISOString(),
-        call_attempts: (nextOnWaitlist.call_attempts || 0) + 1,
-      }).eq('id', nextOnWaitlist.id)
+    // Only try to fill if slot is more than 2 hours away
+    const slotDateTime = new Date(`${booking.date}T${convertTo24h(booking.time)}`)
+    const hoursUntilSlot = (slotDateTime.getTime() - Date.now()) / (1000 * 60 * 60)
 
-      const waitlistAssistantId = process.env.VAPI_WAITLIST_ASSISTANT_ID || clinic.vapi_assistant_id
-      const phoneNumberId = process.env.VAPI_PHONE_NUMBER_ID
-
-      if (waitlistAssistantId && phoneNumberId) {
-        await triggerVapiCall({
-          assistantId:   waitlistAssistantId,
-          phoneNumberId,
-          customerPhone: nextOnWaitlist.phone,
-          customerName:  nextOnWaitlist.patient_name,
-          variables: {
-            availableDate: booking.date,
-            availableTime: booking.time,
-            service:       nextOnWaitlist.service,
-            clinicName:    clinic.name,
-            clinicPhone,
-          },
+    if (hoursUntilSlot > 2) {
+      // Create cancelled slot record
+      const { data: slotRecord } = await supabase
+        .from('cancelled_slots')
+        .insert({
+          clinic_id:  clinic.id,
+          booking_id: booking.id,
+          service:    booking.service,
+          slot_date:  booking.date,
+          slot_time:  booking.time,
+          status:     'open',
         })
+        .select()
+        .single()
+
+      if (slotRecord) {
+        // Trigger fill engine — fire and forget
+        const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://pearlydesk-api.vercel.app'
+        fetch(`${appUrl}/api/internal/fill-slot`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-internal-secret': process.env.CRON_SECRET || '',
+          },
+          body: JSON.stringify({ slotId: slotRecord.id }),
+        }).catch(err => console.error('[cancel] Fill trigger error:', err))
       }
+    } else {
+      console.log(`[cancel] Slot in ${hoursUntilSlot.toFixed(1)}h — too soon to fill via waitlist`)
     }
 
-    return vapiSuccess(toolCallId, `Done. Your ${booking.service} on ${booking.date} at ${booking.time} has been cancelled. You will receive a confirmation text now.`)
+    console.log(`[cancel] Cancelled — ${booking.patient_name} ${booking.service} ${booking.date} ${booking.time}`)
+
+    return vapiSuccess(
+      toolCallId,
+      `Done. Your ${booking.service} on ${booking.date} at ${booking.time} has been cancelled. You will receive a confirmation text now. Would you like to rebook for another time or join our waitlist?`
+    )
   } catch (err) {
     console.error('[cancel] Unhandled error:', err)
     return vapiError(toolCallId, 'I am having some trouble. Please call us directly.')
   }
+}
+
+function convertTo24h(time: string): string {
+  const match = time.match(/(\d+):(\d+)\s*(AM|PM)/i)
+  if (!match) return '12:00:00'
+  let hour = parseInt(match[1])
+  const min = match[2]
+  const period = match[3].toUpperCase()
+  if (period === 'PM' && hour !== 12) hour += 12
+  if (period === 'AM' && hour === 12) hour = 0
+  return `${String(hour).padStart(2, '0')}:${min}:00`
 }

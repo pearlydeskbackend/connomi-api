@@ -39,6 +39,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       return vapiError(toolCallId, 'I am having trouble with our system. Please call us directly.')
     }
 
+    // Check if already on waitlist
     const { data: existing } = await supabase
       .from('waitlist')
       .select('id')
@@ -52,16 +53,28 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       return vapiSuccess(toolCallId, 'You are already on our waitlist! We will call you as soon as a slot opens up.')
     }
 
+    // Detect time of day preference from preferredTimes string
+    let preferredTimeOfDay: string | null = null
+    if (preferredTimes) {
+      const lower = preferredTimes.toLowerCase()
+      if (lower.includes('morning')) preferredTimeOfDay = 'morning'
+      else if (lower.includes('afternoon')) preferredTimeOfDay = 'afternoon'
+      else if (lower.includes('evening')) preferredTimeOfDay = 'evening'
+    }
+
     const { error } = await supabase.from('waitlist').insert({
-      clinic_id:       clinic.id,
-      patient_name:    patientName,
+      clinic_id:             clinic.id,
+      patient_name:          patientName,
       phone,
-      service,
-      preferred_days:  preferredDays || null,
-      preferred_times: preferredTimes || null,
-      status:          'waiting',
-      call_attempts:   0,
-      added_at:        new Date().toISOString(),
+      service:               service || null,
+      preferred_days:        preferredDays || null,
+      preferred_times:       preferredTimes || null,
+      preferred_time_of_day: preferredTimeOfDay,
+      status:                'waiting',
+      attempt_count:         0,
+      priority:              5,
+      added_at:              new Date().toISOString(),
+      expires_at:            new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
     })
 
     if (error) {
@@ -69,7 +82,12 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       return vapiError(toolCallId, 'I had trouble adding you to the waitlist. Please call us directly.')
     }
 
-    return vapiSuccess(toolCallId, 'You are on the waitlist! We will call you as soon as a slot opens up. Is there anything else I can help you with?')
+    console.log(`[waitlist] Added ${patientName} for ${service || 'any service'} — prefers ${preferredTimeOfDay || 'any time'}`)
+
+    return vapiSuccess(
+      toolCallId,
+      `You are on the waitlist! We will call you as soon as a ${service || 'slot'} opens up. Is there anything else I can help you with?`
+    )
   } catch (err) {
     console.error('[waitlist] Unhandled error:', err)
     return vapiError(toolCallId, 'I am having some trouble. Please call us directly.')

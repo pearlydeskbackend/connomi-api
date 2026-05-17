@@ -60,8 +60,8 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       )
     }
 
-    // Insert booking with 8 second timeout
-    const { error: bookingError } = await Promise.race([
+    // Insert booking
+    const { data: booking, error: bookingError } = await Promise.race([
       supabase.from('bookings').insert({
         clinic_id:      clinic.id,
         patient_name:   patientName,
@@ -75,47 +75,46 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         notes,
         created_at:     new Date().toISOString(),
         updated_at:     new Date().toISOString(),
-      }),
-      new Promise<{ error: Error }>((resolve) =>
-        setTimeout(() => resolve({ error: new Error('Insert timed out') }), 8000)
+      }).select().single(),
+      new Promise<{ data: null; error: Error }>((resolve) =>
+        setTimeout(() => resolve({ data: null, error: new Error('Insert timed out') }), 8000)
       ),
-    ]) as { error: Error | null }
+    ]) as { data: any; error: Error | null }
 
     if (bookingError) {
       console.error('[book] Insert error:', bookingError.message)
       return vapiError(toolCallId, 'I am having trouble completing that booking. Please call us directly.')
     }
 
-    // Upsert patient record — fire and forget
-    const patientUpsert = supabase.from('patients').upsert(
-      {
-        clinic_id:    clinic.id,
-        patient_name: patientName,
-        phone,
-        updated_at:   new Date().toISOString(),
-      },
-      { onConflict: 'clinic_id,phone' }
-    )
-    Promise.resolve(patientUpsert).catch((err: unknown) => {
-      console.error('[book] Patient upsert error:', err)
-    })
+   // Upsert patient record — fire and forget
+Promise.resolve(
+  supabase.from('patients').upsert(
+    {
+      clinic_id:    clinic.id,
+      patient_name: patientName,
+      phone,
+      updated_at:   new Date().toISOString(),
+    },
+    { onConflict: 'clinic_id,phone' }
+      )
+    ).catch((err: unknown) => console.error('[book] Patient upsert error:', err))
 
-    // Send SMS — new patients get confirmation + intake checklist
-    // Returning patients get short confirmation only
-    // Fire and forget — never block the response
+    // Send confirmation SMS — fire and forget
     const clinicPhone = clinic.twilio_phone || clinic.owner_phone || ''
     sendSMS(
       phone,
       smsConfirmation(patientName, service, date, time, clinic.name, clinicPhone, isNewPatient)
-    )
-      .then((sent) => {
-        console.log(`[book] SMS sent (new patient: ${isNewPatient}):`, sent)
-      })
-      .catch((err: unknown) => {
-        console.error('[book] SMS error:', err)
-      })
+    ).catch((err: unknown) => console.error('[book] SMS error:', err))
 
-    // Return success immediately
+    // ─── WAITLIST SLOT CLOSING LOOP ───────────────────────────────
+    // Check if this booking fills an open cancelled slot
+    // Run after response is returned — fire and forget
+    if (booking) {
+      closeWaitlistLoop(booking.id, clinic, phone, patientName, service, date, time, clinicPhone)
+        .catch(err => console.error('[book] Waitlist loop error:', err))
+    }
+    // ─────────────────────────────────────────────────────────────
+
     console.log(`[book] Booking saved — ${patientName} ${service} ${date} at ${clinic.name} (new: ${isNewPatient})`)
 
     return vapiSuccess(
@@ -125,5 +124,82 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   } catch (err) {
     console.error('[book] Unhandled error:', err)
     return vapiError(toolCallId, 'I am having some trouble. Please call us directly.')
+  }
+}
+
+async function closeWaitlistLoop(
+  bookingId: string,
+  clinic: any,
+  phone: string,
+  patientName: string,
+  service: string,
+  date: string,
+  time: string,
+  clinicPhone: string
+) {
+  // Find an open cancelled slot matching this date + time
+  const { data: openSlot } = await supabase
+    .from('cancelled_slots')
+    .select('id')
+    .eq('clinic_id', clinic.id)
+    .eq('slot_date', date)
+    .eq('slot_time', time)
+    .eq('status', 'open')
+    .single()
+
+  if (!openSlot) return // not a waitlist fill — normal booking
+
+  // Mark slot as filled
+  await supabase
+    .from('cancelled_slots')
+    .update({
+      status:    'filled',
+      filled_at: new Date().toISOString(),
+    })
+    .eq('id', openSlot.id)
+
+  // Find the waitlist entry for this patient
+  const { data: waitlistEntry } = await supabase
+    .from('waitlist')
+    .select('id')
+    .eq('clinic_id', clinic.id)
+    .eq('phone', phone)
+    .eq('status', 'called')
+    .single()
+
+  if (waitlistEntry) {
+    // Mark waitlist patient as booked
+    await supabase
+      .from('waitlist')
+      .update({
+        status:             'booked',
+        booked_at:          new Date().toISOString(),
+        matched_booking_id: bookingId,
+      })
+      .eq('id', waitlistEntry.id)
+
+    // Link slot to the waitlist entry
+    await supabase
+      .from('cancelled_slots')
+      .update({ filled_by_waitlist_id: waitlistEntry.id })
+      .eq('id', openSlot.id)
+
+    // Update the attempt log to booked
+    await supabase
+      .from('waitlist_attempts')
+      .update({ outcome: 'booked' })
+      .eq('waitlist_id', waitlistEntry.id)
+      .eq('outcome', 'calling')
+
+    console.log(`[book] Waitlist slot filled — ${patientName} took ${service} on ${date} at ${time}`)
+  }
+
+  // Alert clinic owner that slot was auto-filled
+  const ownerPhone = clinic.owner_phone || clinic.twilio_phone
+  if (ownerPhone) {
+    await sendSMS(
+      ownerPhone,
+      `Pearly filled your ${service} slot on ${date} at ${time}. ${patientName} from the waitlist has been booked and confirmed. — Pearly Desk`
+    )
   }
 }
