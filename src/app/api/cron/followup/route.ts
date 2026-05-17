@@ -119,11 +119,13 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
           customerPhone: appt.phone,
           customerName:  appt.patient_name,
           variables: {
-            patientName:  appt.patient_name,
-            service:      appt.service,
-            clinicName:   clinic.name,
+            patientName:     appt.patient_name,
+            service:         appt.service,
+            callType:        'followup',
+            clinicName:      clinic.name,
             clinicPhone,
             appointmentDate: appt.date,
+            appointmentTime: appt.time,
           },
         })
 
