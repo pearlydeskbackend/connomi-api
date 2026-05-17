@@ -9,8 +9,10 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
+  const force = req.nextUrl.searchParams.get('force') === 'true'
+  console.log(`[briefing] Starting — force: ${force}`)
+
   try {
-    const force = req.nextUrl.searchParams.get('force') === 'true'
     const today          = new Date().toISOString().split('T')[0]
     const twelveHoursAgo = new Date(Date.now() - 12 * 3600000).toISOString()
     const sixMonthsAgo   = new Date(Date.now() - 180 * 86400000).toISOString().split('T')[0]
@@ -18,17 +20,24 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     const { data: clinics } = await supabase
       .from('clinics').select('id, name, owner_phone').eq('active', true)
 
+    console.log(`[briefing] Active clinics: ${clinics?.length || 0}`)
+
     if (!clinics?.length) return NextResponse.json({ success: true })
 
     for (const clinic of clinics) {
-      if (!clinic.owner_phone) continue
+      if (!clinic.owner_phone) {
+        console.log(`[briefing] ${clinic.name} — no owner phone, skipping`)
+        continue
+      }
+
+      console.log(`[briefing] Building summary for ${clinic.name}`)
 
       const { data: todayBookings } = await supabase
         .from('bookings').select('time, status')
         .eq('clinic_id', clinic.id).eq('date', today).neq('status', 'Cancelled')
 
       const { data: pearlyOvernight } = await supabase
-        .from('bookings').select('id')
+        .from('bookings').select('id, patient_name, service, time')
         .eq('clinic_id', clinic.id)
         .in('booked_by', ['pearly', 'vapi'])
         .gte('created_at', twelveHoursAgo)
@@ -37,7 +46,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
         .from('patients').select('id')
         .eq('clinic_id', clinic.id)
         .lt('last_cleaning_date', sixMonthsAgo)
-        .lt('recall_attempts', 3)
+        .in('recall_status', ['pending', 'in_progress'])
 
       const { data: unreadMessages } = await supabase
         .from('messages').select('id')
@@ -48,19 +57,46 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       const recallCount  = recallDue?.length || 0
       const messageCount = unreadMessages?.length || 0
       const bookedTimes  = (todayBookings || []).map(b => b.time)
-      const peakSlots    = ['9:00 AM', '10:00 AM', '11:00 AM', '2:00 PM', '3:00 PM']
+      const peakSlots    = ['9:30 AM', '10:00 AM', '11:00 AM', '2:00 PM', '3:00 PM']
       const emptySlots   = peakSlots.filter(s => !bookedTimes.includes(s))
 
-      const lines = [`Good morning, ${clinic.name} ☀️`, '']
-      if (pearlyCount > 0) lines.push(`Pearly booked ${pearlyCount} appointment${pearlyCount !== 1 ? 's' : ''} while you slept.`)
-      else lines.push('No new bookings overnight.')
-      lines.push(`Today you have ${todayCount} patient${todayCount !== 1 ? 's' : ''} scheduled.`)
-      if (emptySlots.length > 0) lines.push(`Open slots: ${emptySlots.slice(0, 3).join(', ')}.`)
-      if (recallCount > 0) lines.push(`${recallCount} patient${recallCount !== 1 ? 's are' : ' is'} overdue for their 6-month cleaning.`)
-      if (messageCount > 0) lines.push(`${messageCount} unread message${messageCount !== 1 ? 's' : ''} in your inbox.`)
-      lines.push('', 'Have a great day. — Pearly Desk')
+      console.log(`[briefing] ${clinic.name} — today: ${todayCount} bookings, overnight: ${pearlyCount}, recall: ${recallCount}, messages: ${messageCount}`)
 
-      await sendSMS(clinic.owner_phone, lines.join('\n'))
+      const lines = [`Good morning, ${clinic.name} ☀️`, '']
+
+      if (pearlyCount > 0) {
+        lines.push(`🌙 Pearly booked ${pearlyCount} appointment${pearlyCount !== 1 ? 's' : ''} while you slept:`)
+        for (const b of pearlyOvernight || []) {
+          lines.push(`   → ${b.patient_name} — ${b.service} at ${b.time}`)
+        }
+        lines.push('')
+      } else {
+        lines.push('No new bookings overnight.')
+      }
+
+      lines.push(`📅 Today: ${todayCount} patient${todayCount !== 1 ? 's' : ''} scheduled.`)
+
+      if (emptySlots.length > 0) {
+        lines.push(`🕐 Open slots: ${emptySlots.slice(0, 3).join(', ')}.`)
+      }
+
+      if (recallCount > 0) {
+        lines.push(`📞 ${recallCount} patient${recallCount !== 1 ? 's are' : ' is'} overdue for their 6-month cleaning.`)
+      }
+
+      if (messageCount > 0) {
+        lines.push(`💬 ${messageCount} unread message${messageCount !== 1 ? 's' : ''} in your inbox.`)
+      }
+
+      lines.push('', 'Have a great day. — Pearly Desk')
+      lines.push('dashboard.pearlydesk.com')
+
+      const message = lines.join('\n')
+      console.log(`[briefing] Sending to ${clinic.owner_phone}:\n${message}`)
+
+      const sent = await sendSMS(clinic.owner_phone, message)
+      console.log(`[briefing] SMS sent: ${sent}`)
+
       await new Promise(r => setTimeout(r, 500))
     }
 
