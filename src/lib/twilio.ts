@@ -174,3 +174,23 @@ export function smsBriefing(
   parts.push(`Login: dashboard.pearlydesk.com`)
   return parts.join('\n')
 }
+
+export function smsRecallFollowUp(
+  name: string,
+  clinicName: string,
+  clinicPhone: string,
+  attemptNumber: number
+): string {
+  if (attemptNumber === 1) {
+    return `Hi ${name}, we tried calling you from ${clinicName} about your overdue cleaning. Give us a call at ${clinicPhone} or reply YES to book — we would love to see you soon!`
+  }
+  return `Hi ${name}, last reminder from ${clinicName} — it has been over 6 months since your last cleaning. Call ${clinicPhone} to book or reply YES. Reply STOP to opt out.`
+}
+
+export function smsRecallFinal(
+  name: string,
+  clinicName: string,
+  clinicPhone: string
+): string {
+  return `Hi ${name}, we miss you at ${clinicName}! It has been a while since your last cleaning. When you are ready, call us at ${clinicPhone} — we are always happy to see you. Reply STOP to opt out.`
+}

@@ -27,7 +27,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     const today       = new Date().toISOString().split('T')[0]
 
     // ── CONFIRM ──────────────────────────────────────────────────
-    if (['confirm', 'yes', 'c', 'confirmed', 'y'].includes(message)) {
+    if (['confirm', 'c', 'confirmed'].includes(message)) {
       const { data: booking } = await supabase
         .from('bookings')
         .select('*')
@@ -40,7 +40,6 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         .single()
 
       if (booking) {
-        // Update status to Patient Confirmed so dashboard shows checkmark
         await supabase
           .from('bookings')
           .update({
@@ -60,6 +59,59 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
           from,
           `Thanks! We look forward to seeing you. Questions? Call ${clinicPhone}.`
         )
+      }
+    }
+
+    // ── YES — could be confirm OR recall reply ────────────────────
+    else if (['yes', 'y'].includes(message)) {
+      // First check if they have an upcoming booking to confirm
+      const { data: booking } = await supabase
+        .from('bookings')
+        .select('*')
+        .eq('clinic_id', clinic.id)
+        .eq('phone', phone)
+        .in('status', ['Confirmed'])
+        .gte('date', today)
+        .order('date', { ascending: true })
+        .limit(1)
+        .single()
+
+      if (booking) {
+        // They have an upcoming booking — treat YES as confirm
+        await supabase
+          .from('bookings')
+          .update({
+            status:     'Patient Confirmed',
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', booking.id)
+
+        await sendSMS(
+          from,
+          `Confirmed! See you on ${booking.date} at ${booking.time} at ${clinic.name}. If anything changes call ${clinicPhone}.`
+        )
+
+        console.log(`[webhook] ${booking.patient_name} confirmed via YES for ${booking.date} ${booking.time}`)
+      } else {
+        // No upcoming booking — they are replying YES to a recall SMS
+        await sendSMS(
+          from,
+          `Great! We will have Pearly call you shortly to get you booked in at ${clinic.name}. Expect a call in the next few minutes!`
+        )
+
+        // Mark patient for immediate recall callback
+        await supabase
+          .from('patients')
+          .update({
+            recall_status:          'pending',
+            recall_next_attempt_at: new Date().toISOString(),
+            recall_sequence_step:   0,
+            updated_at:             new Date().toISOString(),
+          })
+          .eq('clinic_id', clinic.id)
+          .eq('phone', phone)
+
+        console.log(`[webhook] ${phone} replied YES to recall — queued for immediate callback`)
       }
     }
 
@@ -98,7 +150,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         console.log(`[webhook] ${booking.patient_name} cancelled via SMS`)
 
         // Trigger waitlist fill if slot is more than 2 hours away
-        const slotDateTime = new Date(`${booking.date}T12:00:00`)
+        const slotDateTime   = new Date(`${booking.date}T12:00:00`)
         const hoursUntilSlot = (slotDateTime.getTime() - Date.now()) / (1000 * 60 * 60)
 
         if (hoursUntilSlot > 2) {
@@ -135,21 +187,30 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       }
     }
 
-    // ── UNSUBSCRIBE ──────────────────────────────────────────────
+    // ── UNSUBSCRIBE / OPT OUT ────────────────────────────────────
     else if (['stop', 'unsubscribe', 'quit', 'end'].includes(message)) {
       if (phone) {
+        // Mark patient as opted out of recall — permanent
         await supabase
           .from('patients')
           .update({
-            recall_called_at: '2099-01-01T00:00:00.000Z',
-            recall_attempts:  99,
+            recall_status:          'opted_out',
+            recall_next_attempt_at: null,
+            updated_at:             new Date().toISOString(),
           })
           .eq('clinic_id', clinic.id)
           .eq('phone', phone)
+
+        await sendSMS(
+          from,
+          `You have been removed from our recall list at ${clinic.name}. Call us anytime at ${clinicPhone} when you are ready to book.`
+        )
+
+        console.log(`[webhook] ${phone} opted out of recall`)
       }
     }
 
-    // ── ANYTHING ELSE → save as message ─────────────────────────
+    // ── ANYTHING ELSE → save as unread message ───────────────────
     else {
       await supabase.from('messages').insert({
         clinic_id:    clinic.id,
