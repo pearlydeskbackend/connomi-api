@@ -40,12 +40,14 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       return vapiError(toolCallId, 'I am having trouble with our system. Please call us directly.')
     }
 
+    const today = new Date().toISOString().split('T')[0]
     const { data: booking } = await supabase
       .from('bookings')
       .select('*')
       .eq('clinic_id', clinic.id)
       .eq('phone', phone)
-      .in('status', ['Confirmed', 'Checked In'])
+      .in('status', ['Confirmed', 'Checked In', 'Patient Confirmed'])
+      .gte('date', today)
       .order('date', { ascending: true })
       .limit(1)
       .single()
