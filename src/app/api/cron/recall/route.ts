@@ -5,16 +5,23 @@ import { supabase } from '@/lib/supabase'
 import { triggerVapiCall } from '@/lib/vapi'
 import { sendSMS, smsRecallFollowUp, smsRecallFinal } from '@/lib/twilio'
 import { isWithinCallingHours, nextCallingWindow } from '@/lib/schedule'
+import {
+  startCronLog,
+  completeCronLog,
+  failCronLog,
+  wasContactedRecently,
+  markContacted,
+} from '@/lib/cron'
 
 // Sequence configuration — easy to adjust per clinic in future
 const SEQUENCE = [
-  // Step 0 — First attempt: call + SMS if no answer
+  // Step 0 — First attempt: call + SMS
   {
     step:          0,
     action:        'call' as const,
     daysUntilNext: 3,
   },
-  // Step 1 — Second attempt: call + SMS if no answer
+  // Step 1 — Second attempt: call + SMS
   {
     step:          1,
     action:        'call' as const,
@@ -42,6 +49,8 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ success: true, skipped: true, reason: nextCallingWindow() })
   }
 
+  const logId = await startCronLog('recall')
+
   try {
     const now           = new Date().toISOString()
     const sixMonthsAgo  = new Date()
@@ -51,25 +60,29 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     const phoneNumberId = process.env.VAPI_PHONE_NUMBER_ID
 
     if (!assistantId || !phoneNumberId) {
+      await failCronLog(logId, 'VAPI_RECALL_ASSISTANT_ID not set')
       return NextResponse.json({ error: 'VAPI_RECALL_ASSISTANT_ID not set' }, { status: 500 })
     }
 
     const { data: patients, error } = await supabase
       .from('patients')
-      .select('*, clinics(id, name, owner_phone, twilio_phone, active)')
+      .select('*, clinics(id, name, owner_phone, twilio_phone, active, timezone)')
       .lt('last_cleaning_date', cutoffDate)
       .in('recall_status', ['pending', 'in_progress'])
+      .is('deleted_at', null)
       .or(`recall_next_attempt_at.is.null,recall_next_attempt_at.lte.${now}`)
       .order('recall_next_attempt_at', { ascending: true, nullsFirst: true })
       .limit(15)
 
     if (error) {
       console.error('[recall] Query error:', error.message)
+      await failCronLog(logId, error.message)
       return NextResponse.json({ error: 'Query failed' }, { status: 500 })
     }
 
     if (!patients?.length) {
       console.log('[recall] No patients due for recall')
+      await completeCronLog(logId, { called: 0, smsOnly: 0, skipped: 0, total: 0 })
       return NextResponse.json({ success: true, called: 0, smsOnly: 0 })
     }
 
@@ -86,9 +99,18 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
         owner_phone: string | null
         twilio_phone: string | null
         active: boolean
+        timezone: string | null
       } | null
 
       if (!clinic?.active) {
+        skipped++
+        continue
+      }
+
+      // Rate limit — never contact same patient twice in 24 hours
+      const recentlyContacted = await wasContactedRecently(clinic.id, patient.phone)
+      if (recentlyContacted) {
+        console.log(`[recall] ${patient.patient_name} — contacted recently — skipping`)
         skipped++
         continue
       }
@@ -129,10 +151,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
           called++
           console.log(`[recall] Call initiated for ${patient.patient_name}`)
 
-          // Send SMS immediately after initiating the call
-          // We do not wait for the Vapi webhook — we send directly
-          // If they answered the call they will ignore the SMS
-          // If they did not answer the SMS is the follow-up they need
+          // Send SMS immediately — no webhook dependency
           const isLastStep = currentStep >= 1
           const smsSent = await sendSMS(
             patient.phone,
@@ -140,13 +159,15 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
               ? smsRecallFinal(patient.patient_name, clinic.name, clinicPhone)
               : smsRecallFollowUp(patient.patient_name, clinic.name, clinicPhone, currentStep + 1)
           )
-          console.log(`[recall] Follow-up SMS sent: ${smsSent} to ${patient.patient_name}`)
+          console.log(`[recall] SMS sent: ${smsSent} to ${patient.patient_name}`)
+
+          // Mark as contacted for rate limiting
+          await markContacted(clinic.id, patient.phone)
         } else {
-          console.log(`[recall] Call failed for ${patient.patient_name} — skipping SMS`)
+          console.log(`[recall] Call failed for ${patient.patient_name}`)
         }
 
       } else if (sequence.action === 'sms') {
-        // Final step — SMS only, no more calls
         actionSucceeded = await sendSMS(
           patient.phone,
           smsRecallFinal(patient.patient_name, clinic.name, clinicPhone)
@@ -154,6 +175,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
         if (actionSucceeded) {
           smsOnly++
           console.log(`[recall] Final SMS sent to ${patient.patient_name}`)
+          await markContacted(clinic.id, patient.phone)
         }
       }
 
@@ -176,25 +198,21 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
           })
           .eq('id', patient.id)
 
-        console.log(`[recall] ${patient.patient_name} — advanced to step ${nextStep}${isExhausted ? ' (exhausted)' : ` — next attempt in ${sequence.daysUntilNext} days`}`)
+        console.log(`[recall] ${patient.patient_name} — step ${nextStep}${isExhausted ? ' (exhausted)' : ` — next in ${sequence.daysUntilNext} days`}`)
       }
 
-      // Respectful delay between patients
       await new Promise(r => setTimeout(r, 2000))
     }
 
     console.log(`[recall] Done — called: ${called}, smsOnly: ${smsOnly}, skipped: ${skipped}`)
 
-    return NextResponse.json({
-      success: true,
-      called,
-      smsOnly,
-      skipped,
-      total: patients.length,
-    })
+    const result = { called, smsOnly, skipped, total: patients.length }
+    await completeCronLog(logId, result)
+    return NextResponse.json({ success: true, ...result })
 
   } catch (err) {
     console.error('[recall] Unhandled error:', err)
+    await failCronLog(logId, String(err))
     return NextResponse.json({ error: 'Internal error' }, { status: 500 })
   }
 }

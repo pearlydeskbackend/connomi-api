@@ -5,6 +5,13 @@ import { supabase } from '@/lib/supabase'
 import { triggerVapiCall } from '@/lib/vapi'
 import { sendSMS } from '@/lib/twilio'
 import { isWithinCallingHours, nextCallingWindow } from '@/lib/schedule'
+import {
+  startCronLog,
+  completeCronLog,
+  failCronLog,
+  wasContactedRecently,
+  markContacted,
+} from '@/lib/cron'
 
 export async function GET(req: NextRequest): Promise<NextResponse> {
   if (req.headers.get('x-cron-secret') !== process.env.CRON_SECRET) {
@@ -16,31 +23,38 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ success: true, skipped: true, reason: nextCallingWindow() })
   }
 
+  const logId = await startCronLog('noshow')
+
   try {
-    const now       = new Date().toISOString()
-    const yesterday = new Date()
+    const now          = new Date().toISOString()
+    const yesterday    = new Date()
     yesterday.setDate(yesterday.getDate() - 1)
     const yesterdayStr = yesterday.toISOString().split('T')[0]
 
     console.log(`[noshow] Checking for no-shows on ${yesterdayStr}`)
 
-    // Find appointments that were Confirmed yesterday but never
-    // changed to Cancelled or Checked In — these are no-shows
+    // Only flag status: Confirmed as no-shows
+    // Patient Confirmed means they replied to SMS — likely showed up
+    // and staff just did not update the status
     const { data: appointments, error } = await supabase
       .from('bookings')
       .select('*, clinics(id, name, owner_phone, twilio_phone, active)')
       .eq('date', yesterdayStr)
-      .in('status', ['Confirmed', 'Patient Confirmed'])
+      .eq('status', 'Confirmed') // intentionally NOT 'Patient Confirmed'
       .is('no_show_at', null)
       .is('cancelled_at', null)
+      .is('reappointment_sent_at', null) // skip if reappointment already called
+      .is('deleted_at', null)
 
     if (error) {
       console.error('[noshow] Query error:', error.message)
+      await failCronLog(logId, error.message)
       return NextResponse.json({ error: 'Query failed' }, { status: 500 })
     }
 
     if (!appointments?.length) {
       console.log('[noshow] No no-shows detected')
+      await completeCronLog(logId, { processed: 0, skipped: 0, total: 0 })
       return NextResponse.json({ success: true, processed: 0 })
     }
 
@@ -66,11 +80,20 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
         continue
       }
 
+      // Rate limit — never contact same patient twice in 24 hours
+      // Prevents overlap with reappointment cron
+      const recentlyContacted = await wasContactedRecently(clinic.id, appt.phone)
+      if (recentlyContacted) {
+        console.log(`[noshow] ${appt.patient_name} — contacted recently — skipping`)
+        skipped++
+        continue
+      }
+
       const clinicPhone = clinic.twilio_phone || clinic.owner_phone || ''
 
       console.log(`[noshow] ${appt.patient_name} — ${appt.service} — marking as no-show`)
 
-      // Mark as no-show
+      // Mark as no-show first — prevents double processing
       await supabase
         .from('bookings')
         .update({
@@ -97,11 +120,12 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 
         if (ok) {
           console.log(`[noshow] Called ${appt.patient_name} for no-show follow-up`)
+          await markContacted(clinic.id, appt.phone)
         }
       }
 
-      // Send SMS as backup
-      await sendSMS(
+      // Send SMS as backup — fire and forget
+      sendSMS(
         appt.phone,
         `Hi ${appt.patient_name}, we missed you at ${clinic.name} today for your ${appt.service}. Hope everything is okay! Call us at ${clinicPhone} to rebook whenever you are ready.`
       ).catch(err => console.error('[noshow] SMS error:', err))
@@ -112,15 +136,13 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 
     console.log(`[noshow] Done — processed: ${processed}, skipped: ${skipped}`)
 
-    return NextResponse.json({
-      success: true,
-      processed,
-      skipped,
-      total: appointments.length,
-    })
+    const result = { processed, skipped, total: appointments.length }
+    await completeCronLog(logId, result)
+    return NextResponse.json({ success: true, ...result })
 
   } catch (err) {
     console.error('[noshow] Unhandled error:', err)
+    await failCronLog(logId, String(err))
     return NextResponse.json({ error: 'Internal error' }, { status: 500 })
   }
 }

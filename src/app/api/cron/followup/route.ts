@@ -5,6 +5,14 @@ import { supabase } from '@/lib/supabase'
 import { triggerVapiCall } from '@/lib/vapi'
 import { sendSMS, smsFollowup, smsFollowupLight } from '@/lib/twilio'
 import { isWithinCallingHours, nextCallingWindow } from '@/lib/schedule'
+import {
+  startCronLog,
+  completeCronLog,
+  failCronLog,
+  wasContactedRecently,
+  markContacted,
+  claimBooking,
+} from '@/lib/cron'
 
 // Services that get a personal Pearly call — high value procedures
 const HIGH_VALUE_SERVICES = [
@@ -29,7 +37,7 @@ const LIGHT_FOLLOWUP_SERVICES = [
   'invisalign',
 ]
 
-function getFollowupType(service: string): 'call' | 'sms' | 'none' {
+function getFollowupType(service: string): 'call' | 'sms' {
   const lower = service.toLowerCase()
   if (HIGH_VALUE_SERVICES.some(s => lower.includes(s))) return 'call'
   if (LIGHT_FOLLOWUP_SERVICES.some(s => lower.includes(s))) return 'sms'
@@ -45,6 +53,8 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   if (!isWithinCallingHours(force)) {
     return NextResponse.json({ success: true, skipped: true, reason: nextCallingWindow() })
   }
+
+  const logId = await startCronLog('followup')
 
   try {
     const now = new Date().toISOString()
@@ -64,17 +74,22 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       .gte('date', followupDateEnd)
       .lte('date', followupDateStart)
       .is('followup_sent_at', null)
+      .is('no_show_at', null)       // never follow up with no-shows
+      .is('cancelled_at', null)     // never follow up with cancellations
+      .is('deleted_at', null)
       .not('service', 'ilike', '%consult%')
       .order('date', { ascending: true })
       .limit(20)
 
     if (error) {
       console.error('[followup] Query error:', error.message)
+      await failCronLog(logId, error.message)
       return NextResponse.json({ error: 'Query failed' }, { status: 500 })
     }
 
     if (!appointments?.length) {
       console.log('[followup] No appointments due for follow-up')
+      await completeCronLog(logId, { calls: 0, sms: 0, skipped: 0, total: 0 })
       return NextResponse.json({ success: true, calls: 0, sms: 0 })
     }
 
@@ -97,6 +112,22 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       } | null
 
       if (!clinic?.active) {
+        skipped++
+        continue
+      }
+
+      // Idempotency — claim before processing
+      const claimed = await claimBooking(appt.id, 'followup_sent_at')
+      if (!claimed) {
+        console.log(`[followup] ${appt.patient_name} — already claimed — skipping`)
+        skipped++
+        continue
+      }
+
+      // Rate limit — never contact same patient twice in 24 hours
+      const recentlyContacted = await wasContactedRecently(clinic.id, appt.phone)
+      if (recentlyContacted) {
+        console.log(`[followup] ${appt.patient_name} — contacted recently — skipping`)
         skipped++
         continue
       }
@@ -135,13 +166,9 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
         }
 
       } else {
-        // Light touch — warm SMS
-        const isHighValue = followupType === 'call'
         sent = await sendSMS(
           appt.phone,
-          isHighValue
-            ? smsFollowup(appt.patient_name, appt.service, clinic.name, clinicPhone)
-            : smsFollowupLight(appt.patient_name, appt.service, clinic.name, clinicPhone)
+          smsFollowupLight(appt.patient_name, appt.service, clinic.name, clinicPhone)
         )
 
         if (sent) {
@@ -159,6 +186,8 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
             updated_at:       now,
           })
           .eq('id', appt.id)
+
+        await markContacted(clinic.id, appt.phone)
       }
 
       await new Promise(r => setTimeout(r, 1000))
@@ -166,16 +195,13 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 
     console.log(`[followup] Done — calls: ${calls}, sms: ${sms}, skipped: ${skipped}`)
 
-    return NextResponse.json({
-      success: true,
-      calls,
-      sms,
-      skipped,
-      total: appointments.length,
-    })
+    const result = { calls, sms, skipped, total: appointments.length }
+    await completeCronLog(logId, result)
+    return NextResponse.json({ success: true, ...result })
 
   } catch (err) {
     console.error('[followup] Unhandled error:', err)
+    await failCronLog(logId, String(err))
     return NextResponse.json({ error: 'Internal error' }, { status: 500 })
   }
 }

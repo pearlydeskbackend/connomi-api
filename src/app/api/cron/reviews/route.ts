@@ -4,9 +4,17 @@ export const dynamic = 'force-dynamic'
 import { supabase } from '@/lib/supabase'
 import { sendSMS, smsReview } from '@/lib/twilio'
 import { isWithinCallingHours, nextCallingWindow } from '@/lib/schedule'
+import {
+  startCronLog,
+  completeCronLog,
+  failCronLog,
+  wasContactedRecently,
+  markContacted,
+  claimBooking,
+} from '@/lib/cron'
 
 // Check if a patient had any complaints or unresolved issues
-// around the time of their appointment
+// around the time of their appointment — skip review if so
 async function hadComplaint(
   clinicId: string,
   phone: string,
@@ -17,10 +25,10 @@ async function hadComplaint(
   const threeDaysAfter = new Date(appointmentDate)
   threeDaysAfter.setDate(threeDaysAfter.getDate() + 3)
 
-  // Check messages table for complaints around appointment date
+  // Check messages table for urgent messages around appointment
   const { data: messages } = await supabase
     .from('messages')
-    .select('id, urgency')
+    .select('id')
     .eq('clinic_id', clinicId)
     .eq('phone', phone)
     .in('urgency', ['urgent', 'emergency'])
@@ -36,7 +44,7 @@ async function hadComplaint(
   // Check call_logs for unresolved calls
   const { data: calls } = await supabase
     .from('call_logs')
-    .select('id, outcome')
+    .select('id')
     .eq('clinic_id', clinicId)
     .eq('outcome', 'unresolved')
     .gte('created_at', threeDaysBefore.toISOString())
@@ -61,6 +69,8 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ success: true, skipped: true, reason: nextCallingWindow() })
   }
 
+  const logId = await startCronLog('reviews')
+
   try {
     const threeDaysAgo = new Date()
     threeDaysAgo.setDate(threeDaysAgo.getDate() - 3)
@@ -74,15 +84,20 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       .eq('date', targetDate)
       .in('status', ['Checked In', 'Confirmed', 'Patient Confirmed'])
       .is('review_sent', null)
+      .is('no_show_at', null)       // exclude no-shows
+      .is('cancelled_at', null)     // exclude cancellations
+      .is('deleted_at', null)       // exclude soft deleted
       .not('phone', 'is', null)
 
     if (error) {
       console.error('[reviews] Query error:', error.message)
+      await failCronLog(logId, error.message)
       return NextResponse.json({ error: error.message }, { status: 500 })
     }
 
     if (!appointments?.length) {
       console.log(`[reviews] No appointments found for ${targetDate}`)
+      await completeCronLog(logId, { sent: 0, skipped: 0, failed: 0, total: 0 })
       return NextResponse.json({ success: true, sent: 0, skipped: 0, date: targetDate })
     }
 
@@ -103,6 +118,22 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 
       if (!clinic) continue
 
+      // Idempotency — claim before processing
+      const claimed = await claimBooking(appt.id, 'review_sent')
+      if (!claimed) {
+        console.log(`[reviews] ${appt.patient_name} — already claimed — skipping`)
+        skipped++
+        continue
+      }
+
+      // Rate limit — skip if contacted recently
+      const recentlyContacted = await wasContactedRecently(clinic.id, appt.phone)
+      if (recentlyContacted) {
+        console.log(`[reviews] ${appt.patient_name} — contacted recently — skipping`)
+        skipped++
+        continue
+      }
+
       // Skip patients who had complaints or unresolved issues
       const complaint = await hadComplaint(clinic.id, appt.phone, appt.date)
       if (complaint) {
@@ -111,17 +142,14 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       }
 
       const reviewLink = clinic.google_review_link || 'https://g.page/r/review'
-
-      // Personalized review message referencing their specific service
-      const message = smsReview(appt.patient_name, clinic.name, reviewLink)
-
-      const ok = await sendSMS(appt.phone, message)
+      const ok         = await sendSMS(appt.phone, smsReview(appt.patient_name, clinic.name, reviewLink))
 
       if (ok) {
         await supabase
           .from('bookings')
           .update({ review_sent: new Date().toISOString() })
           .eq('id', appt.id)
+        await markContacted(clinic.id, appt.phone)
         console.log(`[reviews] Sent to ${appt.patient_name} — ${appt.service}`)
         sent++
       } else {
@@ -134,16 +162,13 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 
     console.log(`[reviews] Done — sent: ${sent}, skipped: ${skipped}, failed: ${failed}`)
 
-    return NextResponse.json({
-      success: true,
-      sent,
-      failed,
-      skipped,
-      total: appointments.length,
-      date: targetDate,
-    })
+    const result = { sent, failed, skipped, total: appointments.length, date: targetDate }
+    await completeCronLog(logId, result)
+    return NextResponse.json({ success: true, ...result })
+
   } catch (err) {
     console.error('[reviews] Unhandled error:', err)
+    await failCronLog(logId, String(err))
     return NextResponse.json({ error: 'Internal error' }, { status: 500 })
   }
 }
