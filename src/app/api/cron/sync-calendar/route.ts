@@ -6,9 +6,13 @@ import { parseICal, dateToSlotTime, dateToSlotDate } from '@/lib/ical'
 import { startCronLog, completeCronLog, failCronLog } from '@/lib/cron'
 
 export async function GET(req: NextRequest): Promise<NextResponse> {
-  if (req.headers.get('x-cron-secret') !== process.env.CRON_SECRET) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+  const authHeader  = req.headers.get('authorization')
+const cronSecret  = req.headers.get('x-cron-secret')
+const authorized  = authHeader === `Bearer ${process.env.CRON_SECRET}` ||
+                    cronSecret === process.env.CRON_SECRET
+if (!authorized) {
+  return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+}
 
   const logId = await startCronLog('sync-calendar')
 

@@ -7,15 +7,13 @@ import { sendSMS, smsWaitlistOffer } from '@/lib/twilio'
 import { startCronLog, completeCronLog, failCronLog } from '@/lib/cron'
 
 export async function GET(req: NextRequest): Promise<NextResponse> {
-  const cronSecret = req.headers.get('x-cron-secret')
-  const vercelCron = req.headers.get('x-vercel-cron')
-  console.log('[cascade] Auth — x-cron-secret:', cronSecret ? 'present' : 'missing', 'x-vercel-cron:', JSON.stringify(vercelCron))
-
-  const authorized = cronSecret === process.env.CRON_SECRET || vercelCron === '1'
-  if (!authorized) {
-    console.log('[cascade] Unauthorized')
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+  const authHeader  = req.headers.get('authorization')
+const cronSecret  = req.headers.get('x-cron-secret')
+const authorized  = authHeader === `Bearer ${process.env.CRON_SECRET}` ||
+                    cronSecret === process.env.CRON_SECRET
+if (!authorized) {
+  return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+}
 
   const force = req.nextUrl.searchParams.get('force') === 'true'
   const logId = await startCronLog('waitlist-cascade')

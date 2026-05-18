@@ -13,10 +13,13 @@ import {
 } from '@/lib/cron'
 
 export async function GET(req: NextRequest): Promise<NextResponse> {
-  const authorized = req.headers.get('x-cron-secret') === process.env.CRON_SECRET || req.headers.get('x-vercel-cron') === '1'
-  if (!authorized) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+  const authHeader  = req.headers.get('authorization')
+const cronSecret  = req.headers.get('x-cron-secret')
+const authorized  = authHeader === `Bearer ${process.env.CRON_SECRET}` ||
+                    cronSecret === process.env.CRON_SECRET
+if (!authorized) {
+  return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+}
 
   const force = req.nextUrl.searchParams.get('force') === 'true'
   if (!isWithinCallingHours(force)) {
