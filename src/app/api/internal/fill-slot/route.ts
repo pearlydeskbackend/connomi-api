@@ -38,6 +38,15 @@ function getDayOfWeek(dateStr: string): number {
   return new Date(y, m - 1, d).getDay()
 }
 
+// Format date for natural speech — "Wednesday the 20 of May"
+function formatDateForSpeech(dateStr: string): string {
+  const [y, m, d] = dateStr.split('-').map(Number)
+  const dt        = new Date(y, m - 1, d)
+  const dayName   = dt.toLocaleDateString('en-CA', { weekday: 'long' })
+  const monthName = dt.toLocaleDateString('en-CA', { month: 'long' })
+  return `${dayName} the ${d} of ${monthName}`
+}
+
 function scoreCandidate(candidate: any, slot: any): number {
   let score = 100
 
@@ -113,8 +122,6 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     console.log(`[fill-slot] Processing slot ${slotId}`)
 
     // ── STEP 1: ATOMIC CLAIM ──────────────────────────────────────
-    // Update and select separately — Supabase does not support
-    // .select('*, clinics(*)') on .update() reliably
     const { data: claimed, error: claimError } = await supabase
       .from('cancelled_slots')
       .update({
@@ -242,7 +249,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 
     console.log(`[fill-slot] ${scored.length} eligible candidates`)
     scored.slice(0, 3).forEach((s, i) => {
-      console.log(`[fill-slot] #${i + 1} ${s.candidate.patient_name} score=${s.score}`)
+      console.log(`[fill-slot] #${i + 1} ${s.candidate.patient_name} score=${Math.round(s.score)}`)
     })
 
     // ── STEP 7: BUILD QUEUE ───────────────────────────────────────
@@ -314,8 +321,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 
     // ── STEP 10: CONTACT CANDIDATE #1 ────────────────────────────
     let contactMethod = 'none'
-    const assistantId   = process.env.VAPI_WAITLIST_ASSISTANT_ID
-    const phoneNumberId = process.env.VAPI_PHONE_NUMBER_ID
+    const assistantId        = process.env.VAPI_WAITLIST_ASSISTANT_ID
+    const phoneNumberId      = process.env.VAPI_PHONE_NUMBER_ID
+    const availableDateSpoken = formatDateForSpeech(String(slot.slot_date))
 
     if (isUrgent) {
       const smsSent = await sendSMS(
@@ -354,12 +362,13 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         customerPhone: best.phone,
         customerName:  best.patient_name,
         variables: {
-          patientName:   best.patient_name,
-          availableDate: String(slot.slot_date),
-          availableTime: slot.slot_time,
-          service:       slot.service,
-          slotId:        slotId!,
-          clinicName:    clinic?.name || '',
+          patientName:          best.patient_name,
+          availableDate:        String(slot.slot_date),
+          availableDateSpoken,  // "Wednesday the 20 of May" — say this not the raw date
+          availableTime:        slot.slot_time,
+          service:              slot.service,
+          slotId:               slotId!,
+          clinicName:           clinic?.name || '',
           clinicPhone,
         },
       })
@@ -383,13 +392,13 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     console.log(`[fill-slot] Done — ${best.patient_name} via ${contactMethod} — ${scored.length - 1} in queue`)
 
     return NextResponse.json({
-      success:        true,
-      method:         contactMethod,
-      patient:        best.patient_name,
-      score:          scored[0].score,
-      queued:         scored.length - 1,
-      urgent:         isUrgent,
-      hoursUntilSlot: Math.round(hoursUntilSlot * 10) / 10,
+      success:          true,
+      method:           contactMethod,
+      patient:          best.patient_name,
+      score:            Math.round(scored[0].score),
+      queued:           scored.length - 1,
+      urgent:           isUrgent,
+      hoursUntilSlot:   Math.round(hoursUntilSlot * 10) / 10,
     })
 
   } catch (err) {
