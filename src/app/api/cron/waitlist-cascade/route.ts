@@ -7,28 +7,22 @@ import { sendSMS, smsWaitlistOffer } from '@/lib/twilio'
 import { startCronLog, completeCronLog, failCronLog } from '@/lib/cron'
 
 export async function GET(req: NextRequest): Promise<NextResponse> {
-  const cronSecret  = req.headers.get('x-cron-secret')
-  const vercelCron  = req.headers.get('x-vercel-cron')
-  console.log('[cascade] Auth headers — x-cron-secret:', cronSecret ? 'present' : 'missing', 'x-vercel-cron:', vercelCron)
-  
-  export async function GET(req: NextRequest): Promise<NextResponse> {
-  const cronSecret  = req.headers.get('x-cron-secret')
-  const vercelCron  = req.headers.get('x-vercel-cron')
-  console.log('[cascade] Auth headers — x-cron-secret:', cronSecret ? 'present' : 'missing', 'x-vercel-cron:', vercelCron)
-  
+  const cronSecret = req.headers.get('x-cron-secret')
+  const vercelCron = req.headers.get('x-vercel-cron')
+  console.log('[cascade] Auth — x-cron-secret:', cronSecret ? 'present' : 'missing', 'x-vercel-cron:', JSON.stringify(vercelCron))
+
   const authorized = cronSecret === process.env.CRON_SECRET || vercelCron === '1'
   if (!authorized) {
-    console.log('[cascade] Unauthorized — vercelCron value:', JSON.stringify(vercelCron))
+    console.log('[cascade] Unauthorized')
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
+
   const force = req.nextUrl.searchParams.get('force') === 'true'
   const logId = await startCronLog('waitlist-cascade')
 
   try {
     const now = new Date().toISOString()
 
-    // Get all pending queue jobs that are due
-    // Only jobs where slot is still open
     const { data: jobs, error } = await supabase
       .from('waitlist_call_queue')
       .select(`
@@ -65,7 +59,6 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       const slotInfo = (job as any).cancelled_slots
       const clinic   = (job as any).clinics
 
-      // Skip if slot is no longer open
       if (!slotInfo || slotInfo.status !== 'open') {
         console.log(`[cascade] Slot ${job.slot_id} no longer open — expiring job`)
         await supabase
@@ -76,14 +69,12 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
         continue
       }
 
-      // Skip if slot has passed
       const slotDate = new Date(`${job.slot_date}T12:00:00`)
       if (slotDate < new Date()) {
         await supabase
           .from('waitlist_call_queue')
           .update({ status: 'expired', outcome: 'slot_passed' })
           .eq('id', job.id)
-          .eq('slot_id', job.slot_id)
         await supabase
           .from('cancelled_slots')
           .update({ status: 'expired' })
@@ -92,7 +83,6 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
         continue
       }
 
-      // Check waitlist entry still valid
       const { data: waitlistEntry } = await supabase
         .from('waitlist')
         .select('status')
@@ -113,21 +103,19 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 
       console.log(`[cascade] Processing position ${job.queue_position} — ${job.patient_name}`)
 
-      // Claim the job atomically
       const { data: claimed } = await supabase
         .from('waitlist_call_queue')
         .update({ status: 'calling', attempted_at: now })
         .eq('id', job.id)
         .eq('status', 'pending')
         .select()
-        .single()
+        .maybeSingle()
 
       if (!claimed) {
         skipped++
         continue
       }
 
-      // Mark waitlist as called
       await supabase
         .from('waitlist')
         .update({ status: 'called', last_attempt_at: now })
@@ -148,7 +136,6 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 
         if (success) {
           sms++
-          // Reset to waiting so YES reply can book
           await supabase
             .from('waitlist')
             .update({ status: 'waiting' })
@@ -160,17 +147,20 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
         }
 
       } else if (assistantId && phoneNumberId) {
+        const availableDateSpoken = formatDateForSpeech(String(job.slot_date))
+
         success = await triggerVapiCall({
           assistantId,
           phoneNumberId,
           customerPhone: job.phone,
           customerName:  job.patient_name,
           variables: {
-            patientName:   job.patient_name,
-            availableDate: job.slot_date,
-            availableTime: job.slot_time,
-            service:       job.service,
-            slotId:        job.slot_id,
+            patientName:          job.patient_name,
+            availableDate:        String(job.slot_date),
+            availableDateSpoken,
+            availableTime:        job.slot_time,
+            service:              job.service,
+            slotId:               job.slot_id,
             clinicName,
             clinicPhone,
           },
@@ -186,7 +176,6 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       }
 
       if (!success) {
-        // Contact failed — skip this candidate
         await supabase
           .from('waitlist_call_queue')
           .update({ status: 'skipped', outcome: 'contact_failed' })
@@ -212,4 +201,12 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     await failCronLog(logId, String(err))
     return NextResponse.json({ error: 'Internal error' }, { status: 500 })
   }
+}
+
+function formatDateForSpeech(dateStr: string): string {
+  const [y, m, d] = dateStr.split('-').map(Number)
+  const dt        = new Date(y, m - 1, d)
+  const dayName   = dt.toLocaleDateString('en-CA', { weekday: 'long' })
+  const monthName = dt.toLocaleDateString('en-CA', { month: 'long' })
+  return `${dayName} the ${d} of ${monthName}`
 }
