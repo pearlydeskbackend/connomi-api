@@ -8,17 +8,16 @@ export interface ICalEvent {
   raw:       string
 }
 
-// Parse a raw iCal string into structured events
 export function parseICal(raw: string): ICalEvent[] {
   const events: ICalEvent[] = []
   const lines = raw
-    .replace(/\r\n /g, '')   // unfold long lines
-    .replace(/\r\n\t/g, '')  // unfold tab-continued lines
+    .replace(/\r\n /g, '')
+    .replace(/\r\n\t/g, '')
     .split(/\r\n|\n|\r/)
 
-  let inEvent     = false
+  let inEvent      = false
   let currentEvent: Record<string, string> = {}
-  let rawBlock    = ''
+  let rawBlock     = ''
 
   for (const line of lines) {
     if (line === 'BEGIN:VEVENT') {
@@ -30,10 +29,8 @@ export function parseICal(raw: string): ICalEvent[] {
 
     if (line === 'END:VEVENT') {
       rawBlock += line + '\n'
-
       const event = buildEvent(currentEvent, rawBlock)
       if (event) events.push(event)
-
       inEvent      = false
       currentEvent = {}
       rawBlock     = ''
@@ -42,19 +39,12 @@ export function parseICal(raw: string): ICalEvent[] {
 
     if (inEvent) {
       rawBlock += line + '\n'
-
-      // Handle property parameters like DTSTART;TZID=America/Vancouver:20260520T100000
       const colonIdx = line.indexOf(':')
       if (colonIdx === -1) continue
-
       const keyPart = line.substring(0, colonIdx)
       const value   = line.substring(colonIdx + 1)
-
-      // Strip parameters from key (e.g. DTSTART;TZID=... → DTSTART)
-      const key = keyPart.split(';')[0].toUpperCase()
-      const params = keyPart.includes(';') ? keyPart.substring(keyPart.indexOf(';') + 1) : ''
-
-      // Store both key and full key+params for date parsing
+      const key     = keyPart.split(';')[0].toUpperCase()
+      const params  = keyPart.includes(';') ? keyPart.substring(keyPart.indexOf(';') + 1) : ''
       currentEvent[key]           = value
       currentEvent[`${key}_FULL`] = `${params}:${value}`
     }
@@ -69,8 +59,6 @@ function buildEvent(props: Record<string, string>, raw: string): ICalEvent | nul
   const status  = (props['STATUS'] || 'CONFIRMED').toLowerCase()
 
   if (!uid) return null
-
-  // Skip free/cancelled events
   if (status === 'cancelled' || status === 'free') return null
 
   const startAt = parseICalDate(props['DTSTART'] || '', props['DTSTART_FULL'] || '')
@@ -78,22 +66,17 @@ function buildEvent(props: Record<string, string>, raw: string): ICalEvent | nul
 
   if (!startAt || !endAt) return null
 
-  // Extract provider from ORGANIZER or DESCRIPTION
   const organizer = props['ORGANIZER'] || ''
   const provider  = organizer.replace(/^.*CN=/i, '').replace(/;.*$/, '').trim() || ''
 
   return { uid, summary, startAt, endAt, status, provider, raw }
 }
 
-// Parse iCal date formats:
-// DTSTART:20260520T100000Z               → UTC
-// DTSTART;TZID=America/Vancouver:20260520T100000 → local time
-// DTSTART:20260520                        → all day
 function parseICalDate(value: string, fullParam: string): Date | null {
   if (!value) return null
 
   try {
-    // All day event: YYYYMMDD
+    // All day: YYYYMMDD
     if (/^\d{8}$/.test(value)) {
       const y = parseInt(value.substring(0, 4))
       const m = parseInt(value.substring(4, 6)) - 1
@@ -101,7 +84,7 @@ function parseICalDate(value: string, fullParam: string): Date | null {
       return new Date(y, m, d, 0, 0, 0)
     }
 
-    // UTC datetime: YYYYMMDDTHHMMSSZ
+    // UTC: YYYYMMDDTHHMMSSZ
     if (value.endsWith('Z')) {
       const y  = parseInt(value.substring(0, 4))
       const mo = parseInt(value.substring(4, 6)) - 1
@@ -112,7 +95,7 @@ function parseICalDate(value: string, fullParam: string): Date | null {
       return new Date(Date.UTC(y, mo, d, h, mi, s))
     }
 
-    // Local time with TZID: YYYYMMDDTHHMMSS
+    // Local with TZID: YYYYMMDDTHHMMSS
     if (/^\d{8}T\d{6}$/.test(value)) {
       const y  = parseInt(value.substring(0, 4))
       const mo = parseInt(value.substring(4, 6)) - 1
@@ -121,14 +104,10 @@ function parseICalDate(value: string, fullParam: string): Date | null {
       const mi = parseInt(value.substring(11, 13))
       const s  = parseInt(value.substring(13, 15))
 
-      // Extract timezone from params
       const tzMatch = fullParam.match(/TZID=([^:;]+)/i)
       const tz      = tzMatch?.[1] || 'America/Vancouver'
-
-      // Convert local time to UTC using Intl
-      const localDateStr = `${y}-${String(mo + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}T${String(h).padStart(2, '0')}:${String(mi).padStart(2, '0')}:${String(s).padStart(2, '0')}`
-      const utcMs        = localToUTC(localDateStr, tz)
-      return new Date(utcMs)
+      const localStr = `${y}-${String(mo + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}T${String(h).padStart(2, '0')}:${String(mi).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+      return new Date(localToUTC(localStr, tz))
     }
 
     return null
@@ -137,40 +116,31 @@ function parseICalDate(value: string, fullParam: string): Date | null {
   }
 }
 
-// Convert a local datetime string to UTC milliseconds
 function localToUTC(localStr: string, timezone: string): number {
   try {
-    // Use Intl to find the UTC offset for this timezone at this datetime
-    const testDate   = new Date(localStr + 'Z') // treat as UTC first
-    const formatter  = new Intl.DateTimeFormat('en-US', {
-      timeZone:    timezone,
-      year:        'numeric',
-      month:       '2-digit',
-      day:         '2-digit',
-      hour:        '2-digit',
-      minute:      '2-digit',
-      second:      '2-digit',
-      hour12:      false,
+    const testDate  = new Date(localStr + 'Z')
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      year:     'numeric',
+      month:    '2-digit',
+      day:      '2-digit',
+      hour:     '2-digit',
+      minute:   '2-digit',
+      second:   '2-digit',
+      hour12:   false,
     })
-    const parts      = formatter.formatToParts(testDate)
-    const tzYear     = parseInt(parts.find(p => p.type === 'year')?.value   || '0')
-    const tzMonth    = parseInt(parts.find(p => p.type === 'month')?.value  || '0') - 1
-    const tzDay      = parseInt(parts.find(p => p.type === 'day')?.value    || '0')
-    const tzHour     = parseInt(parts.find(p => p.type === 'hour')?.value   || '0')
-    const tzMinute   = parseInt(parts.find(p => p.type === 'minute')?.value || '0')
-    const tzSecond   = parseInt(parts.find(p => p.type === 'second')?.value || '0')
+    const parts    = formatter.formatToParts(testDate)
+    const tzYear   = parseInt(parts.find(p => p.type === 'year')?.value   || '0')
+    const tzMonth  = parseInt(parts.find(p => p.type === 'month')?.value  || '0') - 1
+    const tzDay    = parseInt(parts.find(p => p.type === 'day')?.value    || '0')
+    const tzHour   = parseInt(parts.find(p => p.type === 'hour')?.value   || '0')
+    const tzMinute = parseInt(parts.find(p => p.type === 'minute')?.value || '0')
+    const tzSecond = parseInt(parts.find(p => p.type === 'second')?.value || '0')
 
-    const tzDate     = new Date(localStr + 'Z')
-    const localDate  = new Date(localStr)
-
-    // Calculate offset
     const tzDisplayMs = Date.UTC(tzYear, tzMonth, tzDay, tzHour === 24 ? 0 : tzHour, tzMinute, tzSecond)
-    const testMs      = testDate.getTime()
-    const offset      = testMs - tzDisplayMs
-
-    return localDate.getTime() + offset
+    const offset      = testDate.getTime() - tzDisplayMs
+    return new Date(localStr).getTime() + offset
   } catch {
-    // Fallback — assume Vancouver time (UTC-7 or UTC-8)
     const d      = new Date(localStr)
     const offset = isDST(d) ? 7 : 8
     return d.getTime() + offset * 60 * 60 * 1000
@@ -183,7 +153,6 @@ function isDST(date: Date): boolean {
   return Math.max(jan, jul) !== date.getTimezoneOffset()
 }
 
-// Convert a Date to "10:00 AM" format in Vancouver time
 export function dateToSlotTime(date: Date, timezone = 'America/Vancouver'): string {
   return date.toLocaleTimeString('en-US', {
     timeZone: timezone,
@@ -193,7 +162,6 @@ export function dateToSlotTime(date: Date, timezone = 'America/Vancouver'): stri
   })
 }
 
-// Convert a Date to "2026-05-20" format in Vancouver time
 export function dateToSlotDate(date: Date, timezone = 'America/Vancouver'): string {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: timezone,
