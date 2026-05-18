@@ -81,8 +81,13 @@ async function syncClinicCalendar(
 
   // Fetch the iCal feed
   const response = await fetch(icalUrl, {
-    headers: { 'User-Agent': 'PearlyDesk/1.0 Calendar Sync' },
-    signal:  AbortSignal.timeout(10000), // 10 second timeout
+    headers: {
+      'User-Agent':     'PearlyDesk/1.0 Calendar Sync',
+      'Cache-Control':  'no-cache, no-store',
+      'Pragma':         'no-cache',
+    },
+    cache:  'no-store',
+    signal: AbortSignal.timeout(10000),
   })
 
   if (!response.ok) {
