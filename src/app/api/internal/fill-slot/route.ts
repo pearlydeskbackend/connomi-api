@@ -255,7 +255,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       service:        slot.service,
       slot_date:      slot.slot_date,
       slot_time:      slot.slot_time,
-      priority_score: s.score,
+      priority_score: Math.round(s.score),
       queue_position: index + 1,
       status:         index === 0 ? 'calling' : 'pending',
       method:         isUrgent ? 'sms' : 'call',
