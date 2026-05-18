@@ -34,13 +34,12 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     console.log(`[reappointment] Checking patients seen on ${yesterdayStr}`)
 
     // Find patients seen yesterday who have not already rebooked
-    const { data: appointments, error } = await supabase
+const { data: appointments, error } = await supabase
       .from('bookings')
       .select('*, clinics(id, name, owner_phone, twilio_phone, active)')
       .eq('date', yesterdayStr)
       .in('status', ['Confirmed', 'Patient Confirmed', 'Checked In'])
       .is('reappointment_sent_at', null)
-      .in('service', REAPPOINTMENT_SERVICES.map(s => s))
 
     if (error) {
       console.error('[reappointment] Query error:', error.message)
