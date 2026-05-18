@@ -10,9 +10,10 @@ import {
 } from '@/lib/cron'
 
 export async function GET(req: NextRequest): Promise<NextResponse> {
-  if (req.headers.get('x-cron-secret') !== process.env.CRON_SECRET) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+  const authorized = req.headers.get('x-cron-secret') === process.env.CRON_SECRET || req.headers.get('x-vercel-cron') === '1'
+    if (!authorized) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+      }
 
   const force = req.nextUrl.searchParams.get('force') === 'true'
   console.log(`[briefing] Starting — force: ${force}`)

@@ -1,4 +1,11 @@
 import { supabase } from '@/lib/supabase'
+import { NextRequest } from 'next/server'
+
+export function isAuthorizedCron(req: NextRequest): boolean {
+  const cronSecret  = req.headers.get('x-cron-secret')
+  const vercelCron  = req.headers.get('x-vercel-cron')
+  return cronSecret === process.env.CRON_SECRET || vercelCron === '1'
+}
 
 // ─── CRON EXECUTION LOGGING ───────────────────────────────────────────────────
 

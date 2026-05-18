@@ -13,8 +13,6 @@ import {
   claimBooking,
 } from '@/lib/cron'
 
-// Check if a patient had any complaints or unresolved issues
-// around the time of their appointment — skip review if so
 async function hadComplaint(
   clinicId: string,
   phone: string,
@@ -25,7 +23,6 @@ async function hadComplaint(
   const threeDaysAfter = new Date(appointmentDate)
   threeDaysAfter.setDate(threeDaysAfter.getDate() + 3)
 
-  // Check messages table for urgent messages around appointment
   const { data: messages } = await supabase
     .from('messages')
     .select('id')
@@ -41,7 +38,6 @@ async function hadComplaint(
     return true
   }
 
-  // Check call_logs for unresolved calls
   const { data: calls } = await supabase
     .from('call_logs')
     .select('id')
@@ -60,7 +56,8 @@ async function hadComplaint(
 }
 
 export async function GET(req: NextRequest): Promise<NextResponse> {
-  if (req.headers.get('x-cron-secret') !== process.env.CRON_SECRET) {
+  const authorized = req.headers.get('x-cron-secret') === process.env.CRON_SECRET || req.headers.get('x-vercel-cron') === '1'
+  if (!authorized) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
@@ -84,9 +81,9 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       .eq('date', targetDate)
       .in('status', ['Checked In', 'Confirmed', 'Patient Confirmed'])
       .is('review_sent', null)
-      .is('no_show_at', null)       // exclude no-shows
-      .is('cancelled_at', null)     // exclude cancellations
-      .is('deleted_at', null)       // exclude soft deleted
+      .is('no_show_at', null)
+      .is('cancelled_at', null)
+      .is('deleted_at', null)
       .not('phone', 'is', null)
 
     if (error) {
@@ -118,7 +115,6 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 
       if (!clinic) continue
 
-      // Idempotency — claim before processing
       const claimed = await claimBooking(appt.id, 'review_sent')
       if (!claimed) {
         console.log(`[reviews] ${appt.patient_name} — already claimed — skipping`)
@@ -126,7 +122,6 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
         continue
       }
 
-      // Rate limit — skip if contacted recently
       const recentlyContacted = await wasContactedRecently(clinic.id, appt.phone)
       if (recentlyContacted) {
         console.log(`[reviews] ${appt.patient_name} — contacted recently — skipping`)
@@ -134,7 +129,6 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
         continue
       }
 
-      // Skip patients who had complaints or unresolved issues
       const complaint = await hadComplaint(clinic.id, appt.phone, appt.date)
       if (complaint) {
         skipped++

@@ -12,7 +12,11 @@ import {
 } from '@/lib/cron'
 
 export async function GET(req: NextRequest): Promise<NextResponse> {
-  if (req.headers.get('x-cron-secret') !== process.env.CRON_SECRET) {
+ const cronSecret    = req.headers.get('x-cron-secret')
+  const vercelCron    = req.headers.get('x-vercel-cron')
+  const isAuthorized  = cronSecret === process.env.CRON_SECRET || vercelCron === '1'
+
+  if (!isAuthorized) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 

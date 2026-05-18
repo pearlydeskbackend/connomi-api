@@ -45,7 +45,8 @@ function getFollowupType(service: string): 'call' | 'sms' {
 }
 
 export async function GET(req: NextRequest): Promise<NextResponse> {
-  if (req.headers.get('x-cron-secret') !== process.env.CRON_SECRET) {
+  const authorized = req.headers.get('x-cron-secret') === process.env.CRON_SECRET || req.headers.get('x-vercel-cron') === '1'
+  if (!authorized) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
