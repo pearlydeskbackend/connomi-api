@@ -124,7 +124,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       .eq('id', slotId)
       .eq('status', 'open')
       .select('id, status')
-      .single()
+      .maybeSingle()
+
+    console.log('[fill-slot] Claim result:', JSON.stringify(claimed), 'error:', claimError?.message)
 
     if (claimError || !claimed) {
       console.log(`[fill-slot] Slot ${slotId} not available — already processing or filled`)
