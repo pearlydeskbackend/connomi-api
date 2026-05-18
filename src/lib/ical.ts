@@ -19,27 +19,18 @@ export function parseICal(raw: string): ICalEvent[] {
   let currentEvent: Record<string, string> = {}
   let rawBlock     = ''
 
-  console.log('[ical] parseICal — total lines:', lines.length)
-
   for (const line of lines) {
     if (line === 'BEGIN:VEVENT') {
       inEvent      = true
       currentEvent = {}
       rawBlock     = line + '\n'
-      console.log('[ical] Found BEGIN:VEVENT')
       continue
     }
 
     if (line === 'END:VEVENT') {
       rawBlock += line + '\n'
-      console.log('[ical] Found END:VEVENT — props:', JSON.stringify(currentEvent))
       const event = buildEvent(currentEvent, rawBlock)
-      if (event) {
-        events.push(event)
-        console.log('[ical] Event built successfully:', event.uid)
-      } else {
-        console.log('[ical] Event build returned null')
-      }
+      if (event) events.push(event)
       inEvent      = false
       currentEvent = {}
       rawBlock     = ''
@@ -59,7 +50,6 @@ export function parseICal(raw: string): ICalEvent[] {
     }
   }
 
-  console.log('[ical] parseICal done — events found:', events.length)
   return events
 }
 
@@ -68,26 +58,13 @@ function buildEvent(props: Record<string, string>, raw: string): ICalEvent | nul
   const summary = props['SUMMARY'] || 'Appointment'
   const status  = (props['STATUS'] || 'CONFIRMED').toLowerCase()
 
-  console.log('[ical] buildEvent — uid:', uid, 'status:', status, 'DTSTART:', props['DTSTART'])
-
-  if (!uid) {
-    console.log('[ical] buildEvent — no uid, returning null')
-    return null
-  }
-  if (status === 'cancelled' || status === 'free') {
-    console.log('[ical] buildEvent — cancelled or free, returning null')
-    return null
-  }
+  if (!uid) return null
+  if (status === 'cancelled' || status === 'free') return null
 
   const startAt = parseICalDate(props['DTSTART'] || '', props['DTSTART_FULL'] || '')
   const endAt   = parseICalDate(props['DTEND'] || '', props['DTEND_FULL'] || '')
 
-  console.log('[ical] buildEvent — startAt:', startAt, 'endAt:', endAt)
-
-  if (!startAt || !endAt) {
-    console.log('[ical] buildEvent — invalid dates, returning null')
-    return null
-  }
+  if (!startAt || !endAt) return null
 
   const organizer = props['ORGANIZER'] || ''
   const provider  = organizer.replace(/^.*CN=/i, '').replace(/;.*$/, '').trim() || ''
@@ -97,8 +74,6 @@ function buildEvent(props: Record<string, string>, raw: string): ICalEvent | nul
 
 function parseICalDate(value: string, fullParam: string): Date | null {
   if (!value) return null
-
-  console.log('[ical] parseICalDate — value:', value, 'fullParam:', fullParam)
 
   try {
     // All day: YYYYMMDD
@@ -117,9 +92,7 @@ function parseICalDate(value: string, fullParam: string): Date | null {
       const h  = parseInt(value.substring(9, 11))
       const mi = parseInt(value.substring(11, 13))
       const s  = parseInt(value.substring(13, 15))
-      const result = new Date(Date.UTC(y, mo, d, h, mi, s))
-      console.log('[ical] parseICalDate UTC result:', result)
-      return result
+      return new Date(Date.UTC(y, mo, d, h, mi, s))
     }
 
     // Local with TZID: YYYYMMDDTHHMMSS
@@ -134,15 +107,11 @@ function parseICalDate(value: string, fullParam: string): Date | null {
       const tzMatch  = fullParam.match(/TZID=([^:;]+)/i)
       const tz       = tzMatch?.[1] || 'America/Vancouver'
       const localStr = `${y}-${String(mo + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}T${String(h).padStart(2, '0')}:${String(mi).padStart(2, '0')}:${String(s).padStart(2, '0')}`
-      const result   = new Date(localToUTC(localStr, tz))
-      console.log('[ical] parseICalDate local result:', result, 'tz:', tz)
-      return result
+      return new Date(localToUTC(localStr, tz))
     }
 
-    console.log('[ical] parseICalDate — no pattern matched for:', value)
     return null
-  } catch (err) {
-    console.error('[ical] parseICalDate error:', err)
+  } catch {
     return null
   }
 }
