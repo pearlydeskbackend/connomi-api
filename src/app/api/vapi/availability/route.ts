@@ -9,20 +9,33 @@ import { vapiSuccess, extractToolCall } from '@/lib/vapi'
 const bookingCache = new Map<string, { data: string[]; expires: number }>()
 
 async function getBookedTimes(clinicId: string, date: string): Promise<Set<string>> {
-  const key = `${clinicId}:${date}`
+  const key    = `${clinicId}:${date}`
   const cached = bookingCache.get(key)
   if (cached && cached.expires > Date.now()) return new Set(cached.data)
 
-  const { data } = await supabase
-    .from('bookings')
-    .select('time')
-    .eq('clinic_id', clinicId)
-    .eq('date', date)
-    .in('status', ['Confirmed', 'Patient Confirmed', 'Checked In'])
+  // Check both our own bookings AND PMS bookings from iCal sync
+  const [pearly, pms] = await Promise.all([
+    supabase
+      .from('bookings')
+      .select('time')
+      .eq('clinic_id', clinicId)
+      .eq('date', date)
+      .in('status', ['Confirmed', 'Patient Confirmed', 'Checked In']),
 
-  const times = (data || []).map((b: any) => b.time)
-  bookingCache.set(key, { data: times, expires: Date.now() + 60000 })
-  return new Set(times)
+    supabase
+      .from('pms_bookings')
+      .select('slot_time')
+      .eq('clinic_id', clinicId)
+      .eq('slot_date', date)
+      .neq('status', 'free'),
+  ])
+
+  const pearlyTimes = (pearly.data || []).map((b: any) => b.time)
+  const pmsTimes    = (pms.data || []).map((b: any) => b.slot_time)
+  const allTimes    = [...pearlyTimes, ...pmsTimes]
+
+  bookingCache.set(key, { data: allTimes, expires: Date.now() + 60000 })
+  return new Set(allTimes)
 }
 
 function timeToMinutes(t: string): number {
