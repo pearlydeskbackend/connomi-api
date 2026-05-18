@@ -60,12 +60,14 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       }
 
       // Get queue job for this slot to find patient details
-      const { data: queueJob } = await supabase
+     const { data: queueJob } = await supabase
         .from('waitlist_call_queue')
         .select('*')
         .eq('slot_id', slotId)
-        .eq('status', 'calling')
-        .single()
+        .in('status', ['calling', 'called'])
+        .order('queue_position', { ascending: true })
+        .limit(1)
+        .maybeSingle()
 
       if (!queueJob) {
         // Release the slot if we cannot find the queue job
@@ -165,12 +167,14 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     if (outcome === 'no') {
 
       // Find queue job
-      const { data: queueJob } = await supabase
+     const { data: queueJob } = await supabase
         .from('waitlist_call_queue')
         .select('*')
         .eq('slot_id', slotId)
-        .eq('status', 'calling')
-        .single()
+        .in('status', ['calling', 'called'])
+        .order('queue_position', { ascending: true })
+        .limit(1)
+        .maybeSingle()
 
       if (queueJob) {
         // Mark queue job as declined
