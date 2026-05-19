@@ -71,9 +71,26 @@ export function smsConfirmation(
   isNewPatient: boolean = false
 ): string {
   if (isNewPatient) {
-    return `Hi ${name}! Your ${service} at ${clinicName} is confirmed ✓\n\n${date} at ${time}\n\nSince it's your first visit, please bring:\n✓ Photo ID\n✓ Insurance card\n✓ List of current medications\n✓ Arrive 10 min early for paperwork\n\nQuestions? Reply to this message or call ${clinicPhone}.\n— ${clinicName}`
+    return `Hi ${name}! Your ${service} at ${clinicName} is confirmed ✓
+
+${date} at ${time}
+
+Since it's your first visit, please bring:
+✓ Photo ID
+✓ Insurance card
+✓ List of current medications
+✓ Arrive 10 min early for paperwork
+
+Reply CONFIRM to confirm or CANCEL to cancel.
+Questions? Call ${clinicPhone} or text HELP.
+— ${clinicName}`
   }
-  return `Hi ${name}, your ${service} at ${clinicName} is confirmed for ${date} at ${time}. Reply CANCEL to cancel or call ${clinicPhone}.`
+
+  // Existing patient — short with command hints
+  return `Hi ${name}, your ${service} at ${clinicName} is confirmed for ${date} at ${time}.
+
+Reply CONFIRM to confirm, CANCEL to cancel, or STATUS to view your appointments.
+Call ${clinicPhone} for help.`
 }
 
 export function smsCancellation(
@@ -84,7 +101,9 @@ export function smsCancellation(
   clinicName: string,
   clinicPhone: string
 ): string {
-  return `Hi ${name}, your ${service} on ${date} at ${time} at ${clinicName} has been cancelled. Call ${clinicPhone} to rebook anytime.`
+  return `Hi ${name}, your ${service} on ${date} at ${time} at ${clinicName} has been cancelled.
+
+Call ${clinicPhone} to rebook or text WAITLIST ${service} to join the waitlist.`
 }
 
 export function smsReschedule(
@@ -95,7 +114,9 @@ export function smsReschedule(
   clinicName: string,
   clinicPhone: string
 ): string {
-  return `Hi ${name}, your ${service} at ${clinicName} has been rescheduled to ${date} at ${time}. Questions? Call ${clinicPhone}.`
+  return `Hi ${name}, your ${service} at ${clinicName} has been rescheduled to ${date} at ${time}.
+
+Reply CONFIRM to confirm or CANCEL to cancel. Questions? Call ${clinicPhone}.`
 }
 
 export function smsReminder(
@@ -106,7 +127,9 @@ export function smsReminder(
   clinicName: string,
   clinicPhone: string
 ): string {
-  return `Hi ${name}, reminder: you have a ${service} at ${clinicName} tomorrow ${date} at ${time}. Reply CONFIRM or call ${clinicPhone}.`
+  return `Hi ${name}, reminder: ${service} at ${clinicName} tomorrow ${date} at ${time}.
+
+Reply CONFIRM to confirm or CANCEL to cancel. Call ${clinicPhone} if needed.`
 }
 
 export function smsRecall(
@@ -114,7 +137,9 @@ export function smsRecall(
   clinicName: string,
   clinicPhone: string
 ): string {
-  return `Hi ${name}, it has been 6 months since your last cleaning at ${clinicName}. Call ${clinicPhone} to book or reply YES.`
+  return `Hi ${name}, it has been 6 months since your last cleaning at ${clinicName}.
+
+Call ${clinicPhone} to book or reply YES. Reply STOP to opt out.`
 }
 
 export function smsReview(
@@ -122,7 +147,9 @@ export function smsReview(
   clinicName: string,
   reviewLink: string
 ): string {
-  return `Hi ${name}, thank you for visiting ${clinicName}! Please leave us a quick review: ${reviewLink} — it only takes 30 seconds!`
+  return `Hi ${name}, thank you for visiting ${clinicName}! We hope everything went well.
+
+Leave us a quick review (30 seconds): ${reviewLink}`
 }
 
 export function smsWelcome(
@@ -161,7 +188,11 @@ export function smsWaitlistOffer(
   clinicName: string,
   clinicPhone: string
 ): string {
-  return `Hi ${name}, a slot just opened at ${clinicName} — ${service} on ${date} at ${time}. Reply YES to grab it or call ${clinicPhone}.`
+  return `Hi ${name}, a slot just opened at ${clinicName}!
+
+${service} — ${date} at ${time}
+
+Reply YES to grab it or NO to skip. Slot may fill quickly. Call ${clinicPhone} if needed.`
 }
 
 export function smsFollowup(
@@ -170,7 +201,9 @@ export function smsFollowup(
   clinicName: string,
   clinicPhone: string
 ): string {
-  return `Hi ${name}, Dr. Do wanted to follow up on your recent ${treatment} at ${clinicName}. How are you feeling? Call us at ${clinicPhone} if you have any concerns.`
+  return `Hi ${name}, following up on your recent ${treatment} at ${clinicName}. How are you feeling?
+
+Call ${clinicPhone} if you have any concerns — we are always here to help.`
 }
 
 export function smsBriefing(
@@ -199,9 +232,13 @@ export function smsRecallFollowUp(
   attemptNumber: number
 ): string {
   if (attemptNumber === 1) {
-    return `Hi ${name}, we tried calling you from ${clinicName} about your overdue cleaning. Give us a call at ${clinicPhone} or reply YES to book — we would love to see you soon!`
+    return `Hi ${name}, we tried calling you from ${clinicName} about your overdue cleaning.
+
+Call ${clinicPhone} or reply YES to book. Reply STOP to opt out.`
   }
-  return `Hi ${name}, last reminder from ${clinicName} — it has been over 6 months since your last cleaning. Call ${clinicPhone} to book or reply YES. Reply STOP to opt out.`
+  return `Hi ${name}, last reminder from ${clinicName} — it has been over 6 months since your last cleaning.
+
+Call ${clinicPhone} or reply YES to book. Reply STOP to opt out.`
 }
 
 export function smsRecallFinal(
@@ -209,7 +246,9 @@ export function smsRecallFinal(
   clinicName: string,
   clinicPhone: string
 ): string {
-  return `Hi ${name}, we miss you at ${clinicName}! It has been a while since your last cleaning. When you are ready, call us at ${clinicPhone} — we are always happy to see you. Reply STOP to opt out.`
+  return `Hi ${name}, we miss you at ${clinicName}! When you are ready, call ${clinicPhone} — we are always happy to see you.
+
+Reply STOP to opt out.`
 }
 
 export function smsFollowupLight(
@@ -218,5 +257,7 @@ export function smsFollowupLight(
   clinicName: string,
   clinicPhone: string
 ): string {
-  return `Hi ${name}, hope you are feeling great after your ${service} at ${clinicName}! Any questions or concerns? Call us at ${clinicPhone} — Dr. Do and the team are always happy to help.`
+  return `Hi ${name}, hope you are feeling great after your ${service} at ${clinicName}!
+
+Any questions or concerns? Call ${clinicPhone} — we are always happy to help.`
 }

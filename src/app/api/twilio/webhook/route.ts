@@ -151,7 +151,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     else if (['help', 'menu', '?'].includes(message)) {
       await sendSMS(
         from,
-        `${clinic.name} — text commands:\n\nSTATUS — see your appointments\nCONFIRM — confirm your next visit\nCANCEL — cancel your next visit\nWAITLIST [service] — join waitlist\nREMOVE — leave waitlist\nSTOP — opt out of all messages\n\nCall ${clinicPhone} for anything else.`
+        `${clinic.name} — text commands:\n\nSTATUS — your appointments\nCONFIRM — confirm visit\nCANCEL — cancel visit\nWAITLIST [service] — join waitlist\nREMOVE — leave waitlist\nSTOP — opt out\n\nCall ${clinicPhone} for help.`
       )
     }
 
