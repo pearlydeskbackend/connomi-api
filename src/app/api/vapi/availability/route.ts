@@ -56,7 +56,7 @@ async function getBookedSlots(
     slots.push({ time: b.slot_time, duration })
   }
 
-  bookingCache.set(key, { data: slots, expires: Date.now() + 60000 })
+  bookingCache.set(key, { data: slots, expires: Date.now() + 10000 })
   return slots
 }
 
