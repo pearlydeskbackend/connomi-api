@@ -19,7 +19,6 @@ const NO_ANSWER_REASONS = [
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
   try {
-    // Use original body parsing — this is what worked before
     const body    = await req.json() as Record<string, unknown>
     const message = body?.message as Record<string, unknown> | undefined
 
@@ -37,17 +36,34 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     const endedReason    = message.endedReason as string || 'unknown'
     const assistantId    = call?.assistantId as string || ''
     const customerPhone  = (call?.customer as Record<string, unknown>)?.number as string || ''
+    const callId         = (message.id ?? call?.id) as string | null || null
 
     const clinic  = await resolveClinic(clinicId, toNumber)
     const outcome = structuredData?.callOutcome || 'unknown'
     const summary = analysis?.summary as string || ''
 
-    console.log(`[end-of-call] endedReason: ${endedReason} assistantId: ${assistantId} customer: ${customerPhone}`)
+    console.log(`[end-of-call] endedReason: ${endedReason} assistantId: ${assistantId} customer: ${customerPhone} callId: ${callId}`)
 
-    // Log call to Supabase
+    // ── DUPLICATE PREVENTION ──────────────────────────────────────
+    // Vapi sometimes fires end-of-call webhook twice for the same call
+    // Check call_id before inserting to prevent duplicate logs
+    if (callId) {
+      const { data: existing } = await supabase
+        .from('call_logs')
+        .select('id')
+        .eq('call_id', callId)
+        .maybeSingle()
+
+      if (existing) {
+        console.log(`[end-of-call] Duplicate webhook for call ${callId} — skipping`)
+        return NextResponse.json({ received: true, duplicate: true })
+      }
+    }
+
+    // ── LOG CALL ──────────────────────────────────────────────────
     await supabase.from('call_logs').insert({
       clinic_id:          clinic?.id || null,
-      call_id:            message.id as string || null,
+      call_id:            callId,
       duration_seconds:   (message.durationSeconds as number) || 0,
       outcome,
       sentiment:          structuredData?.patientSentiment || 'neutral',
@@ -60,15 +76,16 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       created_at:         new Date().toISOString(),
     })
 
-    // Alert owner on unresolved calls
+    // ── ALERT OWNER ON UNRESOLVED CALLS ───────────────────────────
     if (outcome === 'unresolved' && clinic?.owner_phone && summary) {
-      await sendSMS(
+      sendSMS(
         clinic.owner_phone,
         `⚠️ Pearly had trouble with a call.\n\nSummary: ${summary}\n\nCheck your dashboard for details.`
-      )
+      ).catch(err => console.error('[end-of-call] Owner SMS error:', err))
     }
 
-    // ── RECALL SMS ───────────────────────────────────────────────
+    // ── RECALL SMS ────────────────────────────────────────────────
+    // Send SMS when patient did not answer a recall or reengagement call
     const isRecallCall =
       assistantId === process.env.VAPI_RECALL_ASSISTANT_ID ||
       assistantId === process.env.VAPI_REENGAGEMENT_ASSISTANT_ID
@@ -89,7 +106,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         .select('patient_name, recall_sequence_step')
         .eq('clinic_id', clinic.id)
         .eq('phone', customerPhone)
-        .single()
+        .maybeSingle()
 
       if (patient) {
         const step       = patient.recall_sequence_step ?? 0
@@ -117,6 +134,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     }
 
     return NextResponse.json({ received: true })
+
   } catch (err) {
     console.error('[end-of-call] Error:', err)
     return NextResponse.json({ received: true })
