@@ -50,7 +50,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       .gte('date', today)
       .order('date', { ascending: true })
       .limit(1)
-      .single()
+      .maybeSingle()
 
     if (!booking) {
       return vapiError(toolCallId, 'I could not find a confirmed booking under that number. Could you double check or call us directly?')
@@ -89,7 +89,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
           status:     'open',
         })
         .select()
-        .single()
+        .maybeSingle()
 
       if (slotRecord) {
         // Trigger fill engine — fire and forget
