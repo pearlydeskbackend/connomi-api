@@ -6,18 +6,17 @@ import { parseICal, dateToSlotTime, dateToSlotDate } from '@/lib/ical'
 import { startCronLog, completeCronLog, failCronLog } from '@/lib/cron'
 
 export async function GET(req: NextRequest): Promise<NextResponse> {
-  const authHeader  = req.headers.get('authorization')
-const cronSecret  = req.headers.get('x-cron-secret')
-const authorized  = authHeader === `Bearer ${process.env.CRON_SECRET}` ||
-                    cronSecret === process.env.CRON_SECRET
-if (!authorized) {
-  return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-}
+  const authHeader = req.headers.get('authorization')
+  const cronSecret = req.headers.get('x-cron-secret')
+  const authorized = authHeader === `Bearer ${process.env.CRON_SECRET}` ||
+                     cronSecret === process.env.CRON_SECRET
+  if (!authorized) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
 
   const logId = await startCronLog('sync-calendar')
 
   try {
-    // Get all clinics with iCal sync enabled
     const { data: clinics, error } = await supabase
       .from('clinics')
       .select('id, name, ical_url, timezone')
@@ -37,9 +36,9 @@ if (!authorized) {
 
     console.log(`[sync-calendar] Syncing ${clinics.length} clinics`)
 
-    let synced  = 0
-    let failed  = 0
-    let total   = 0
+    let synced = 0
+    let failed = 0
+    let total  = 0
 
     for (const clinic of clinics) {
       try {
@@ -49,7 +48,6 @@ if (!authorized) {
         total  += result.eventsFound
         synced += result.eventsSynced
 
-        // Update last synced timestamp
         await supabase
           .from('clinics')
           .update({ ical_last_synced_at: new Date().toISOString() })
@@ -63,7 +61,7 @@ if (!authorized) {
       }
     }
 
-    console.log(`[sync-calendar] Done — total events: ${total}, synced: ${synced}, failed clinics: ${failed}`)
+    console.log(`[sync-calendar] Done — total: ${total}, synced: ${synced}, failed: ${failed}`)
 
     const result = { total, synced, failed, clinics: clinics.length }
     await completeCronLog(logId, result)
@@ -77,18 +75,17 @@ if (!authorized) {
 }
 
 async function syncClinicCalendar(
-  clinicId: string,
+  clinicId:   string,
   clinicName: string,
-  icalUrl: string,
-  timezone: string
+  icalUrl:    string,
+  timezone:   string
 ): Promise<{ eventsFound: number; eventsSynced: number }> {
 
-  // Fetch the iCal feed
   const response = await fetch(icalUrl, {
     headers: {
-      'User-Agent':     'PearlyDesk/1.0 Calendar Sync',
-      'Cache-Control':  'no-cache, no-store',
-      'Pragma':         'no-cache',
+      'User-Agent':    'PearlyDesk/1.0 Calendar Sync',
+      'Cache-Control': 'no-cache, no-store',
+      'Pragma':        'no-cache',
     },
     cache:  'no-store',
     signal: AbortSignal.timeout(10000),
@@ -103,7 +100,6 @@ async function syncClinicCalendar(
     throw new Error('Invalid iCal format — missing BEGIN:VCALENDAR')
   }
 
-  // Parse events
   const events = parseICal(rawICal)
   console.log(`[sync-calendar] ${clinicName} — parsed ${events.length} events`)
 
@@ -111,13 +107,12 @@ async function syncClinicCalendar(
     return { eventsFound: 0, eventsSynced: 0 }
   }
 
-  // Only sync events in the next 90 days — no point syncing the past
-  const now       = new Date()
-  const maxDate   = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000)
-  const upcoming  = events.filter(e => e.startAt >= now && e.startAt <= maxDate)
+  const now     = new Date()
+  const maxDate = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000)
+  const upcoming = events.filter(e => e.startAt >= now && e.startAt <= maxDate)
 
-  // Delete old PMS bookings for this clinic beyond 1 day ago
-  // This handles cancellations — if event disappears from feed it gets deleted
+  // ── DELETE STALE FUTURE EVENTS ────────────────────────────────
+  // Handles cancellations — if event disappears from feed it gets deleted
   const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000)
   await supabase
     .from('pms_bookings')
@@ -125,26 +120,35 @@ async function syncClinicCalendar(
     .eq('clinic_id', clinicId)
     .gte('start_at', oneDayAgo.toISOString())
 
+  // ── DELETE OLD PAST EVENTS ────────────────────────────────────
+  // Prevents unbounded table growth — at 100 clinics this matters
+  // 100 clinics × 1000 bookings/month = 100k rows/month without this
+  const ninetyDaysAgo = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000)
+  await supabase
+    .from('pms_bookings')
+    .delete()
+    .eq('clinic_id', clinicId)
+    .lt('start_at', ninetyDaysAgo.toISOString())
+
   if (!upcoming.length) {
     return { eventsFound: events.length, eventsSynced: 0 }
   }
 
-  // Upsert all upcoming events
+  // Upsert upcoming events in batches of 50
   const rows = upcoming.map(event => ({
-    clinic_id: clinicId,
-    pms_uid:   event.uid,
-    title:     event.summary,
-    provider:  event.provider || null,
-    start_at:  event.startAt.toISOString(),
-    end_at:    event.endAt.toISOString(),
-    slot_date: dateToSlotDate(event.startAt, timezone),
-    slot_time: dateToSlotTime(event.startAt, timezone),
-    status:    event.status,
-    raw_ical:  event.raw,
+    clinic_id:  clinicId,
+    pms_uid:    event.uid,
+    title:      event.summary,
+    provider:   event.provider || null,
+    start_at:   event.startAt.toISOString(),
+    end_at:     event.endAt.toISOString(),
+    slot_date:  dateToSlotDate(event.startAt, timezone),
+    slot_time:  dateToSlotTime(event.startAt, timezone),
+    status:     event.status,
+    raw_ical:   event.raw,
     updated_at: new Date().toISOString(),
   }))
 
-  // Upsert in batches of 50
   let synced = 0
   for (let i = 0; i < rows.length; i += 50) {
     const batch = rows.slice(i, i + 50)
