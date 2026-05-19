@@ -1,3 +1,7 @@
+// ─── SEND SMS WITH RETRY ──────────────────────────────────────────────────────
+// Retries once on network errors (ECONNRESET, TLS failures)
+// These are transient Vercel → Twilio connection issues — not code bugs
+
 export async function sendSMS(to: string, body: string): Promise<boolean> {
   const accountSid = process.env.TWILIO_ACCOUNT_SID
   const authToken  = process.env.TWILIO_AUTH_TOKEN
@@ -8,29 +12,54 @@ export async function sendSMS(to: string, body: string): Promise<boolean> {
     return false
   }
 
-  try {
+  const attempt = async (): Promise<boolean> => {
     const response = await fetch(
       `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
       {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Authorization: 'Basic ' + Buffer.from(`${accountSid}:${authToken}`).toString('base64'),
+          'Content-Type':  'application/x-www-form-urlencoded',
+          Authorization:   'Basic ' + Buffer.from(`${accountSid}:${authToken}`).toString('base64'),
         },
         body: new URLSearchParams({ From: fromNumber, To: to, Body: body }).toString(),
       }
     )
+
     if (!response.ok) {
-      const data = await response.json() as { message?: string }
-      console.error('[twilio] Error:', data.message)
+      const data = await response.json() as { message?: string; code?: number }
+      console.error('[twilio] Error:', data.message, 'code:', data.code)
       return false
     }
+
     return true
-  } catch (err) {
+  }
+
+  try {
+    return await attempt()
+  } catch (err: any) {
+    // Retry once on transient network errors
+    const isTransient = err?.cause?.code === 'ECONNRESET' ||
+                        err?.cause?.code === 'ECONNREFUSED' ||
+                        err?.cause?.code === 'ETIMEDOUT' ||
+                        err?.message?.includes('fetch failed')
+
+    if (isTransient) {
+      console.warn('[twilio] Transient error — retrying in 1s:', err?.cause?.code || err?.message)
+      await new Promise(r => setTimeout(r, 1000))
+      try {
+        return await attempt()
+      } catch (retryErr) {
+        console.error('[twilio] Retry failed:', retryErr)
+        return false
+      }
+    }
+
     console.error('[twilio] Exception:', err)
     return false
   }
 }
+
+// ─── SMS TEMPLATES ────────────────────────────────────────────────────────────
 
 export function smsConfirmation(
   name: string,
@@ -42,20 +71,8 @@ export function smsConfirmation(
   isNewPatient: boolean = false
 ): string {
   if (isNewPatient) {
-    return `Hi ${name}! Your ${service} at ${clinicName} is confirmed ✓
-
-${date} at ${time}
-
-Since it's your first visit, please bring:
-✓ Photo ID
-✓ Insurance card
-✓ List of current medications
-✓ Arrive 10 min early for paperwork
-
-Questions? Reply to this message or call ${clinicPhone}.
-— ${clinicName}`
+    return `Hi ${name}! Your ${service} at ${clinicName} is confirmed ✓\n\n${date} at ${time}\n\nSince it's your first visit, please bring:\n✓ Photo ID\n✓ Insurance card\n✓ List of current medications\n✓ Arrive 10 min early for paperwork\n\nQuestions? Reply to this message or call ${clinicPhone}.\n— ${clinicName}`
   }
-
   return `Hi ${name}, your ${service} at ${clinicName} is confirmed for ${date} at ${time}. Reply CANCEL to cancel or call ${clinicPhone}.`
 }
 
