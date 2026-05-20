@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 
 // ─── SENSITIVE FIELD REDACTION ────────────────────────────────────────────────
-// Strips credentials before logging — Twilio tokens were appearing in Vercel logs
 
 const SENSITIVE_KEYS = new Set([
   'twilioauthtoken', 'twilioaccountsid', 'authorization',
@@ -24,8 +23,6 @@ function redactSensitive(obj: unknown, depth = 0): unknown {
 }
 
 // ─── RATE LIMITING ────────────────────────────────────────────────────────────
-// In-memory — resets on cold start (acceptable for now)
-// Replace with Upstash Redis at clinic #5+
 
 interface RateEntry {
   count:   number
@@ -34,7 +31,7 @@ interface RateEntry {
 
 const rateLimitStore = new Map<string, RateEntry>()
 const RATE_LIMIT_MAX    = 10
-const RATE_LIMIT_WINDOW = 60 * 1000 // 1 minute
+const RATE_LIMIT_WINDOW = 60 * 1000
 
 export function checkRateLimit(key: string): { allowed: boolean; remaining: number } {
   const now   = Date.now()
@@ -53,7 +50,6 @@ export function checkRateLimit(key: string): { allowed: boolean; remaining: numb
   return { allowed: true, remaining: RATE_LIMIT_MAX - entry.count }
 }
 
-// Clean up expired entries every 5 minutes
 setInterval(() => {
   const now = Date.now()
   for (const [key, entry] of rateLimitStore.entries()) {
@@ -62,12 +58,10 @@ setInterval(() => {
 }, 5 * 60 * 1000)
 
 // ─── WEBHOOK SECRET VERIFICATION ─────────────────────────────────────────────
-// Vapi sends x-pearly-secret header when configured in assistant server settings
-// Falls back to allowing if secret not configured (backward compatible)
 
 export function verifyVapiSecret(req: NextRequest): boolean {
   const secret = process.env.VAPI_WEBHOOK_SECRET
-  if (!secret) return true // not configured — allow all
+  if (!secret) return true
   const header = req.headers.get('x-pearly-secret')
   return header === secret
 }
@@ -92,7 +86,6 @@ export function vapiRateLimited(toolCallId: string): NextResponse {
 
 export function extractToolCall(body: Record<string, unknown>) {
   try {
-    // Redact sensitive fields before logging — prevents credential exposure in Vercel logs
     const safeBody = redactSensitive(body)
     console.log('[vapi] RAW BODY:', JSON.stringify(safeBody, null, 2))
 
@@ -186,6 +179,15 @@ export async function triggerVapiCall(params: {
   variables?:    Record<string, string>
 }): Promise<boolean> {
   try {
+    // ── E.164 VALIDATION ─────────────────────────────────────────
+    // Vapi rejects non-E.164 with 400 — catch it before the call
+    // Prevents silent cascade failures on invalid waitlist numbers
+    // Valid E.164: +1XXXXXXXXXX, +44XXXXXXXXXX, etc.
+    if (!/^\+[1-9]\d{7,14}$/.test(params.customerPhone)) {
+      console.error('[vapi] Invalid E.164 phone format — skipping call:', params.customerPhone)
+      return false
+    }
+
     const response = await fetch('https://api.vapi.ai/call', {
       method: 'POST',
       headers: {
