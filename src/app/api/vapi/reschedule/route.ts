@@ -40,30 +40,66 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       return vapiError(toolCallId, 'I am having trouble with our system. Please call us directly.')
     }
 
+    // Only look at future bookings — never reschedule past appointments
+    const today = new Date().toISOString().split('T')[0]
+
     const { data: booking } = await supabase
       .from('bookings')
       .select('*')
       .eq('clinic_id', clinic.id)
       .eq('phone', phone)
-      .in('status', ['Confirmed', 'Checked In'])
-      .order('date', { ascending: false })
+      .in('status', ['Confirmed', 'Checked In', 'Patient Confirmed'])
+      .gte('date', today)
+      .order('date', { ascending: true })
       .limit(1)
-      .single()
+      .maybeSingle()
 
     if (!booking) {
-      return vapiError(toolCallId, 'I could not find a booking under that number. Could you double check or call us directly?')
+      return vapiError(toolCallId, 'I could not find an upcoming booking under that number. Could you double check or call us directly?')
     }
 
-    await supabase.from('bookings').update({
-      date:       newDate,
-      time:       newTime,
-      updated_at: new Date().toISOString(),
-    }).eq('id', booking.id)
+    // Check new slot is not already taken — never double book
+    const { data: conflict } = await supabase
+      .from('bookings')
+      .select('id')
+      .eq('clinic_id', clinic.id)
+      .eq('date', newDate)
+      .eq('time', newTime)
+      .in('status', ['Confirmed', 'Patient Confirmed', 'Checked In'])
+      .limit(1)
+      .maybeSingle()
+
+    if (conflict) {
+      return vapiError(
+        toolCallId,
+        `That slot at ${newTime} on ${newDate} is already taken. Could you choose a different time?`
+      )
+    }
+
+    // Update the booking
+    await supabase
+      .from('bookings')
+      .update({
+        date:       newDate,
+        time:       newTime,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', booking.id)
 
     const clinicPhone = clinic.twilio_phone || clinic.owner_phone || ''
-    await sendSMS(phone, smsReschedule(patientName || booking.patient_name, booking.service, newDate, newTime, clinic.name, clinicPhone))
 
-    return vapiSuccess(toolCallId, `Done! Your ${booking.service} has been moved to ${newDate} at ${newTime}. You will receive a confirmation text now. See you then!`)
+    sendSMS(
+      phone,
+      smsReschedule(patientName || booking.patient_name, booking.service, newDate, newTime, clinic.name, clinicPhone)
+    ).catch(err => console.error('[reschedule] SMS error:', err))
+
+    console.log(`[reschedule] ${booking.patient_name} moved ${booking.service} to ${newDate} ${newTime}`)
+
+    return vapiSuccess(
+      toolCallId,
+      `Done! Your ${booking.service} has been moved to ${newDate} at ${newTime}. You will receive a confirmation text now. See you then!`
+    )
+
   } catch (err) {
     console.error('[reschedule] Unhandled error:', err)
     return vapiError(toolCallId, 'I am having some trouble. Please call us directly.')
