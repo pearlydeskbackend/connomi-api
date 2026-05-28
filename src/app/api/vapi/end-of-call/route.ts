@@ -38,15 +38,28 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     const customerPhone  = (call?.customer as Record<string, unknown>)?.number as string || ''
     const callId         = (message.id ?? call?.id) as string | null || null
 
+    // Determine call direction — inbound if customer called us, outbound if we called them
+    const direction      = (call?.type as string) === 'outboundPhoneCall' ? 'outbound' : 'inbound'
+
     const clinic  = await resolveClinic(clinicId, toNumber)
     const outcome = structuredData?.callOutcome || 'unknown'
     const summary = analysis?.summary as string || ''
 
-    console.log(`[end-of-call] endedReason: ${endedReason} assistantId: ${assistantId} customer: ${customerPhone} callId: ${callId}`)
+    // Try to look up patient name from phone
+    let patientName: string | null = null
+    if (customerPhone && clinic?.id) {
+      const { data: patient } = await supabase
+        .from('patients')
+        .select('patient_name')
+        .eq('clinic_id', clinic.id)
+        .eq('phone', customerPhone)
+        .maybeSingle()
+      patientName = patient?.patient_name ?? null
+    }
 
-    // ── DUPLICATE PREVENTION ──────────────────────────────────────
-    // Vapi sometimes fires end-of-call webhook twice for the same call
-    // Check call_id before inserting to prevent duplicate logs
+    console.log(`[end-of-call] endedReason: ${endedReason} assistantId: ${assistantId} customer: ${customerPhone} callId: ${callId} direction: ${direction}`)
+
+    // ── DUPLICATE PREVENTION ──────────────────────────────────────────────
     if (callId) {
       const { data: existing } = await supabase
         .from('call_logs')
@@ -60,8 +73,10 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       }
     }
 
-    // ── LOG CALL ──────────────────────────────────────────────────
-    await supabase.from('call_logs').insert({
+    // ── LOG CALL ──────────────────────────────────────────────────────────
+    // Build the log entry — new fields (phone, patient_name, direction) are
+    // additive only. If columns don't exist yet, we fall back to base fields.
+    const baseLog = {
       clinic_id:          clinic?.id || null,
       call_id:            callId,
       duration_seconds:   (message.durationSeconds as number) || 0,
@@ -74,9 +89,22 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       cost_usd:           (message.cost as number) || 0,
       transcript:         message.transcript as string || '',
       created_at:         new Date().toISOString(),
+    }
+
+    const { error: logError } = await supabase.from('call_logs').insert({
+      ...baseLog,
+      phone:        customerPhone || null,
+      patient_name: patientName,
+      direction,
     })
 
-    // ── ALERT OWNER ON UNRESOLVED CALLS ───────────────────────────
+    // Fallback: if new columns don't exist yet, insert without them
+    if (logError) {
+      console.warn('[end-of-call] Full insert failed, trying base fields:', logError.message)
+      await supabase.from('call_logs').insert(baseLog)
+    }
+
+    // ── ALERT OWNER ON UNRESOLVED CALLS ───────────────────────────────────
     if (outcome === 'unresolved' && clinic?.owner_phone && summary) {
       sendSMS(
         clinic.owner_phone,
@@ -84,8 +112,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       ).catch(err => console.error('[end-of-call] Owner SMS error:', err))
     }
 
-    // ── RECALL SMS ────────────────────────────────────────────────
-    // Send SMS when patient did not answer a recall or reengagement call
+    // ── RECALL SMS ────────────────────────────────────────────────────────
     const isRecallCall =
       assistantId === process.env.VAPI_RECALL_ASSISTANT_ID ||
       assistantId === process.env.VAPI_REENGAGEMENT_ASSISTANT_ID
