@@ -1,131 +1,104 @@
-import { NextRequest, NextResponse } from 'next/server'
+// ============================================================================
+// POST /api/vapi/cancel — Sophie cancels the caller's upcoming appointment.
+// Finds the next booking by phone, marks it cancelled, fires the cancellation
+// SMS, and — if the slot is far enough out — opens a cancelled_slots record so
+// the waitlist-fill engine can backfill it. The "far enough out" threshold is
+// the clinic's configurable lead time, not a hardcoded 2 hours.
+// ============================================================================
+import { NextRequest, NextResponse } from "next/server";
+import { db } from "@/lib/supabase";
+import { resolveClinic } from "@/lib/clinic";
+import { extractToolCall, vapiSay, checkRateLimit } from "@/lib/vapi";
+import { normalizePhone } from "@/lib/phone";
+import { CancelSchema } from "@/lib/validators";
+import { findNextBooking } from "@/lib/lookup";
+import { sendSMS, smsCancellation } from "@/lib/twilio";
+import { speakableSlot } from "@/lib/speech";
 
-export const dynamic = 'force-dynamic'
-import { supabase } from '@/lib/supabase'
-import { resolveClinic } from '@/lib/clinic'
-import { sendSMS, smsCancellation } from '@/lib/twilio'
-import { vapiSuccess, vapiError, extractToolCall } from '@/lib/vapi'
-import { formatPhone } from '@/lib/phone'
-import { CancelSchema } from '@/lib/validators'
+export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
-  let toolCallId = 'unknown'
-
+  let toolCallId = "unknown";
   try {
-    const body = await req.json() as Record<string, unknown>
-    const tool = extractToolCall(body)
+    const body = (await req.json()) as Record<string, unknown>;
+    const tool = extractToolCall(body);
+    if (!tool) return vapiSay("unknown", "I'm having trouble with our system. Please call us directly.");
+    toolCallId = tool.toolCallId;
 
-    if (!tool) {
-      return NextResponse.json({
-        results: [{ toolCallId: 'unknown', result: 'I am having trouble with our system. Please call us directly.' }]
-      })
-    }
+    const rl = checkRateLimit(`cancel:${tool.toNumber ?? toolCallId}`);
+    if (!rl.allowed) return vapiSay(toolCallId, "I'm having trouble right now. Please call us directly.");
 
-    toolCallId = tool.toolCallId
+    const parsed = CancelSchema.safeParse(tool.args);
+    if (!parsed.success) return vapiSay(toolCallId, "Could I get your name and phone number to find your booking?");
 
-    const validation = CancelSchema.safeParse(tool.args)
-    if (!validation.success) {
-      return vapiError(toolCallId, 'Could I get your name and phone number to find your booking?')
-    }
+    const phone = normalizePhone(parsed.data.patientPhone);
+    if (!phone) return vapiSay(toolCallId, "I couldn't read that phone number. Could you repeat it?");
 
-    const { patientName, patientPhone } = validation.data
+    const clinic = await resolveClinic(tool.clinicId, tool.toNumber);
+    if (!clinic) return vapiSay(toolCallId, "I'm having trouble with our system. Please call us directly.");
 
-    const phone = formatPhone(patientPhone)
-    if (!phone) {
-      return vapiError(toolCallId, 'I could not verify that phone number. Could you repeat it?')
-    }
-
-    const clinic = await resolveClinic(tool.clinicId, tool.toNumber)
-    if (!clinic) {
-      return vapiError(toolCallId, 'I am having trouble with our system. Please call us directly.')
-    }
-
-    const today = new Date().toISOString().split('T')[0]
-    const { data: booking } = await supabase
-      .from('bookings')
-      .select('*')
-      .eq('clinic_id', clinic.id)
-      .eq('phone', phone)
-      .in('status', ['Confirmed', 'Checked In', 'Patient Confirmed'])
-      .gte('date', today)
-      .order('date', { ascending: true })
-      .limit(1)
-      .maybeSingle()
-
+    const booking = await findNextBooking(clinic.id, phone);
     if (!booking) {
-      return vapiError(toolCallId, 'I could not find a confirmed booking under that number. Could you double check or call us directly?')
+      return vapiSay(toolCallId, "I couldn't find an upcoming booking under that number. Could you double-check, or call us directly?");
     }
 
-    // Cancel the booking
-    await supabase.from('bookings').update({
-      status:       'Cancelled',
-      cancelled_at: new Date().toISOString(),
-      updated_at:   new Date().toISOString(),
-    }).eq('id', booking.id)
+    const now = new Date().toISOString();
+    await db()
+      .from("bookings")
+      .update({ status: "cancelled", cancelled_at: now })
+      .eq("id", booking.id);
 
-    const clinicPhone = clinic.twilio_phone || clinic.owner_phone || ''
+    const clinicPhone = clinic.twilio_phone || clinic.owner_phone || "";
+    sendSMS(
+      phone,
+      smsCancellation({
+        name: booking.patient_name, service: booking.service,
+        startsAt: booking.starts_at, timezone: clinic.timezone,
+        clinicName: clinic.name, clinicPhone,
+      }),
+    ).catch((e) => console.error("[cancel] SMS error:", e));
 
-    // Send cancellation SMS — fire and forget
-    sendSMS(phone, smsCancellation(
-      patientName || booking.patient_name,
-      booking.service, booking.date, booking.time,
-      clinic.name, clinicPhone
-    )).catch(err => console.error('[cancel] SMS error:', err))
-
-    // Only try to fill if slot is more than 2 hours away
-    const slotDateTime = new Date(`${booking.date}T${convertTo24h(booking.time)}`)
-    const hoursUntilSlot = (slotDateTime.getTime() - Date.now()) / (1000 * 60 * 60)
-
-    if (hoursUntilSlot > 2) {
-      // Create cancelled slot record
-      const { data: slotRecord } = await supabase
-        .from('cancelled_slots')
+    // Open the slot for waitlist fill only if it's beyond the clinic's lead time.
+    const leadMs = (clinic.min_lead_time_minutes || 0) * 60_000;
+    const farEnough = new Date(booking.starts_at).getTime() - Date.now() > Math.max(leadMs, 2 * 60 * 60_000);
+    if (farEnough) {
+      const { data: slot } = await db()
+        .from("cancelled_slots")
         .insert({
-          clinic_id:  clinic.id,
+          clinic_id: clinic.id,
           booking_id: booking.id,
-          service:    booking.service,
-          slot_date:  booking.date,
-          slot_time:  booking.time,
-          status:     'open',
+          service: booking.service,
+          starts_at: booking.starts_at,
+          status: "open",
         })
-        .select()
-        .maybeSingle()
-
-      if (slotRecord) {
-        // Trigger fill engine — fire and forget
-        const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://pearlydesk-api.vercel.app'
-        fetch(`${appUrl}/api/internal/fill-slot`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-internal-secret': process.env.CRON_SECRET || '',
-          },
-          body: JSON.stringify({ slotId: slotRecord.id }),
-        }).catch(err => console.error('[cancel] Fill trigger error:', err))
+        .select("id")
+        .maybeSingle();
+      if (slot) {
+        // trigger the internal fill engine (non-blocking)
+        triggerFill(slot.id).catch((e) => console.error("[cancel] fill trigger:", e));
       }
-    } else {
-      console.log(`[cancel] Slot in ${hoursUntilSlot.toFixed(1)}h — too soon to fill via waitlist`)
     }
 
-    console.log(`[cancel] Cancelled — ${booking.patient_name} ${booking.service} ${booking.date} ${booking.time}`)
-
-    return vapiSuccess(
+    return vapiSay(
       toolCallId,
-      `Done. Your ${booking.service} on ${booking.date} at ${booking.time} has been cancelled. You will receive a confirmation text now. Would you like to rebook for another time or join our waitlist?`
-    )
+      `Done — your ${booking.service} on ${speakableSlot(booking.starts_at, clinic.timezone)} is cancelled. You'll get a text confirming it. Would you like to rebook, or join our waitlist for an earlier opening?`,
+    );
   } catch (err) {
-    console.error('[cancel] Unhandled error:', err)
-    return vapiError(toolCallId, 'I am having some trouble. Please call us directly.')
+    console.error("[cancel] unhandled:", err);
+    return vapiSay(toolCallId, "I'm having some trouble. Please call us directly.");
   }
 }
 
-function convertTo24h(time: string): string {
-  const match = time.match(/(\d+):(\d+)\s*(AM|PM)/i)
-  if (!match) return '12:00:00'
-  let hour = parseInt(match[1])
-  const min = match[2]
-  const period = match[3].toUpperCase()
-  if (period === 'PM' && hour !== 12) hour += 12
-  if (period === 'AM' && hour === 12) hour = 0
-  return `${String(hour).padStart(2, '0')}:${min}:00`
+// fire the internal fill-slot worker; uses the platform dashboard origin
+async function triggerFill(slotId: string): Promise<void> {
+  const { env } = await import("@/config/env");
+  const base = env().DASHBOARD_URL;
+  await fetch(`${base.replace(/\/$/, "")}/api/internal/fill-slot`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-internal-secret": process.env.CRON_SECRET ?? "",
+    },
+    body: JSON.stringify({ slotId }),
+  });
 }

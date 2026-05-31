@@ -1,209 +1,138 @@
-import { NextRequest, NextResponse } from 'next/server'
+// ============================================================================
+// POST /api/vapi/waitlist-outcome — Sophie reports a waitlist call result.
+// "yes" -> atomically claim the open slot, book via the tested book_appointment
+// function, mark waitlist + queue booked, expire other queued offers, notify.
+// "no"  -> mark declined, call increment_declined (FIX: v1 assigned the rpc
+//          Promise directly to a column — broken; here it's a real statement).
+// ============================================================================
+import { NextRequest, NextResponse } from "next/server";
+import { db } from "@/lib/supabase";
+import { resolveClinic } from "@/lib/clinic";
+import { extractToolCall, vapiSay } from "@/lib/vapi";
+import { sendSMS, smsWaitlistBooked, smsOwnerWaitlistFilled } from "@/lib/twilio";
+import type { BookResult } from "@/lib/booking-result";
 
-export const dynamic = 'force-dynamic'
-import { supabase } from '@/lib/supabase'
-import { resolveClinic } from '@/lib/clinic'
-import { sendSMS } from '@/lib/twilio'
-import { vapiSuccess, vapiError, extractToolCall } from '@/lib/vapi'
+export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
-  let toolCallId = 'unknown'
-
+  let toolCallId = "unknown";
   try {
-    const body = await req.json() as Record<string, unknown>
-    const tool = extractToolCall(body)
+    const body = (await req.json()) as Record<string, unknown>;
+    const tool = extractToolCall(body);
+    if (!tool) return vapiSay("unknown", "Could not process outcome.");
+    toolCallId = tool.toolCallId;
 
-    if (!tool) {
-      return NextResponse.json({
-        results: [{ toolCallId: 'unknown', result: 'Could not process outcome.' }]
-      })
-    }
+    const { outcome, slotId } = tool.args as { outcome?: string; slotId?: string };
+    if (!outcome || !slotId) return vapiSay(toolCallId, "Missing outcome or slot.");
 
-    toolCallId = tool.toolCallId
+    const clinic = await resolveClinic(tool.clinicId, tool.toNumber);
+    if (!clinic) return vapiSay(toolCallId, "Could not resolve clinic.");
 
-    const { outcome, slotId } = tool.args as {
-      outcome: string
-      slotId: string
-    }
+    const now = new Date().toISOString();
 
-    if (!outcome || !slotId) {
-      return vapiError(toolCallId, 'Missing outcome or slotId.')
-    }
+    // ----- YES: claim + book -----
+    if (outcome === "yes") {
+      // atomically claim: only succeeds if still open
+      const { data: claimed } = await db()
+        .from("cancelled_slots")
+        .update({ status: "processing" })
+        .eq("id", slotId)
+        .eq("status", "open")
+        .select("id, service, starts_at")
+        .maybeSingle();
 
-    const clinic = await resolveClinic(tool.clinicId, tool.toNumber)
-    if (!clinic) {
-      return vapiError(toolCallId, 'Could not resolve clinic.')
-    }
+      if (!claimed) return vapiSay(toolCallId, "slot_taken"); // someone got it first
 
-    const clinicPhone = clinic.twilio_phone || clinic.owner_phone || ''
-    const now         = new Date().toISOString()
-
-    // ── PATIENT SAID YES ──────────────────────────────────────────
-    if (outcome === 'yes') {
-
-      // Atomically claim the slot — prevents double booking
-      const { data: claimed } = await supabase
-        .from('cancelled_slots')
-        .update({ status: 'processing', processing_at: now })
-        .eq('id', slotId)
-        .eq('status', 'open') // only claim if still open
-        .select()
-        .single()
-
-      if (!claimed) {
-        // Slot was just taken by another patient
-        console.log(`[waitlist-outcome] Slot ${slotId} already taken`)
-        return vapiSuccess(
-          toolCallId,
-          'slot_taken'
-        )
-      }
-
-      // Get queue job for this slot to find patient details
-     const { data: queueJob } = await supabase
-        .from('waitlist_call_queue')
-        .select('*')
-        .eq('slot_id', slotId)
-        .in('status', ['calling', 'called'])
-        .order('queue_position', { ascending: true })
+      // find the queued candidate we called for this slot
+      const { data: queueJob } = await db()
+        .from("waitlist_call_queue")
+        .select("*")
+        .eq("slot_id", slotId)
+        .in("status", ["calling", "called"])
+        .order("queue_position", { ascending: true })
         .limit(1)
-        .maybeSingle()
+        .maybeSingle();
 
       if (!queueJob) {
-        // Release the slot if we cannot find the queue job
-        await supabase
-          .from('cancelled_slots')
-          .update({ status: 'open', processing_at: null })
-          .eq('id', slotId)
-
-        return vapiError(toolCallId, 'Could not find queue job.')
+        await db().from("cancelled_slots").update({ status: "open" }).eq("id", slotId);
+        return vapiSay(toolCallId, "Could not find the waitlist entry. Please call us directly.");
       }
 
-      // Create the booking
-      const { error: bookingError } = await supabase
-        .from('bookings')
-        .insert({
-          clinic_id:    clinic.id,
-          patient_name: queueJob.patient_name,
-          phone:        queueJob.phone,
-          service:      queueJob.service,
-          date:         queueJob.slot_date,
-          time:         queueJob.slot_time,
-          status:       'Confirmed',
-          booked_by:    'waitlist',
-          created_at:   now,
-          updated_at:   now,
-        })
+      // book through the tested, race-safe function (same correctness as Sophie's bookings)
+      const { data, error } = await db().rpc("book_appointment", {
+        p_clinic: clinic.id,
+        p_starts_at: claimed.starts_at,
+        p_service: claimed.service ?? queueJob.service ?? "Teeth cleaning",
+        p_patient_name: queueJob.patient_name,
+        p_phone: queueJob.phone,
+        p_source: "waitlist",
+        p_is_new_patient: false,
+      });
+      const result = (data as unknown as BookResult) ?? { ok: false, reason: "slot_taken" };
 
-      if (bookingError) {
-        console.error('[waitlist-outcome] Booking error:', bookingError.message)
-        // Release slot on booking failure
-        await supabase
-          .from('cancelled_slots')
-          .update({ status: 'open', processing_at: null })
-          .eq('id', slotId)
-        return vapiError(toolCallId, 'Could not create booking.')
+      if (error || !result.ok) {
+        await db().from("cancelled_slots").update({ status: "open" }).eq("id", slotId);
+        return vapiSay(toolCallId, "slot_taken");
       }
 
-      // Mark slot as filled
-      const slotDate    = new Date(`${queueJob.slot_date}T12:00:00`)
-      const fillMinutes = Math.round((Date.now() - new Date(claimed.cancelled_at).getTime()) / (1000 * 60))
+      // mark everything booked + expire siblings
+      const wlId = queueJob.waitlist_id;
+      await db().from("cancelled_slots")
+        .update({ status: "filled", filled_at: now, filled_by_waitlist_id: wlId ?? undefined })
+        .eq("id", slotId);
+      if (wlId) {
+        await db().from("waitlist").update({ status: "booked" }).eq("id", wlId);
+      }
+      await db().from("waitlist_call_queue").update({ status: "booked", outcome: "booked" }).eq("id", queueJob.id);
+      await db().from("waitlist_call_queue")
+        .update({ status: "expired", outcome: "slot_filled_by_other" })
+        .eq("slot_id", slotId).in("status", ["pending", "calling"]).neq("id", queueJob.id);
 
-      await supabase
-        .from('cancelled_slots')
-        .update({
-          status:           'filled',
-          filled_at:        now,
-          filled_in_minutes: fillMinutes,
-          filled_by_waitlist_id: queueJob.waitlist_id,
-        })
-        .eq('id', slotId)
+      const clinicPhone = clinic.twilio_phone || clinic.owner_phone || "";
+      sendSMS(queueJob.phone, smsWaitlistBooked({
+        service: claimed.service ?? queueJob.service ?? "appointment",
+        startsAt: claimed.starts_at, timezone: clinic.timezone, clinicName: clinic.name, clinicPhone,
+      })).catch((e) => console.error("[waitlist-outcome] SMS:", e));
 
-      // Mark waitlist entry as booked
-      await supabase
-        .from('waitlist')
-        .update({
-          status:             'booked',
-          booked_at:          now,
-          matched_booking_id: null,
-        })
-        .eq('id', queueJob.waitlist_id)
-
-      // Mark queue job as booked
-      await supabase
-        .from('waitlist_call_queue')
-        .update({ status: 'booked', outcome: 'booked' })
-        .eq('id', queueJob.id)
-
-      // Expire all other pending/calling queue jobs for this slot
-      await supabase
-        .from('waitlist_call_queue')
-        .update({ status: 'expired', outcome: 'slot_filled_by_other' })
-        .eq('slot_id', slotId)
-        .in('status', ['pending', 'calling'])
-        .neq('id', queueJob.id)
-
-      // Send confirmation SMS to patient
-      sendSMS(
-        queueJob.phone,
-        `You are all booked! ${queueJob.service} on ${queueJob.slot_date} at ${queueJob.slot_time} at ${clinic.name}. We look forward to seeing you! Questions? Call ${clinicPhone}.`
-      ).catch(err => console.error('[waitlist-outcome] SMS error:', err))
-
-      // Alert owner
-      const ownerPhone = clinic.owner_phone || clinic.twilio_phone
+      const ownerPhone = clinic.owner_phone || clinic.twilio_phone;
       if (ownerPhone) {
-        sendSMS(
-          ownerPhone,
-          `Pearly filled your ${queueJob.service} slot on ${queueJob.slot_date} at ${queueJob.slot_time} in ${fillMinutes} minutes. ${queueJob.patient_name} from the waitlist is now booked. — Pearly Desk`
-        ).catch(err => console.error('[waitlist-outcome] Owner SMS error:', err))
+        sendSMS(ownerPhone, smsOwnerWaitlistFilled({
+          service: claimed.service ?? queueJob.service ?? "appointment",
+          startsAt: claimed.starts_at, timezone: clinic.timezone, patientName: queueJob.patient_name,
+        })).catch((e) => console.error("[waitlist-outcome] owner SMS:", e));
       }
 
-      console.log(`[waitlist-outcome] ${queueJob.patient_name} booked for ${queueJob.service} ${queueJob.slot_date} — filled in ${fillMinutes} min`)
-
-      return vapiSuccess(toolCallId, 'booked')
+      return vapiSay(toolCallId, "booked");
     }
 
-    // ── PATIENT SAID NO ───────────────────────────────────────────
-    if (outcome === 'no') {
-
-      // Find queue job
-     const { data: queueJob } = await supabase
-        .from('waitlist_call_queue')
-        .select('*')
-        .eq('slot_id', slotId)
-        .in('status', ['calling', 'called'])
-        .order('queue_position', { ascending: true })
+    // ----- NO: decline -----
+    if (outcome === "no") {
+      const { data: queueJob } = await db()
+        .from("waitlist_call_queue")
+        .select("id, waitlist_id, patient_name")
+        .eq("slot_id", slotId)
+        .in("status", ["calling", "called"])
+        .order("queue_position", { ascending: true })
         .limit(1)
-        .maybeSingle()
+        .maybeSingle();
 
       if (queueJob) {
-        // Mark queue job as declined
-        await supabase
-          .from('waitlist_call_queue')
-          .update({ status: 'declined', outcome: 'patient_declined' })
-          .eq('id', queueJob.id)
-
-        // Increment declined count — affects future scoring
-        await supabase
-          .from('waitlist')
-          .update({
-            status:           'waiting', // keep on waitlist for future slots
-            declined_count:   supabase.rpc('increment_declined', { row_id: queueJob.waitlist_id }),
-            last_declined_at: now,
-            last_offered_slot_id: slotId,
-          })
-          .eq('id', queueJob.waitlist_id)
-
-        console.log(`[waitlist-outcome] ${queueJob.patient_name} declined slot ${slotId}`)
+        await db().from("waitlist_call_queue")
+          .update({ status: "declined", outcome: "patient_declined" })
+          .eq("id", queueJob.id);
+        // proper statement — not a Promise assigned to a column (the v1 bug)
+        if (queueJob.waitlist_id) {
+          await db().rpc("increment_declined", { p_waitlist_id: queueJob.waitlist_id });
+        }
+        // release the slot back to open for the next candidate
+        await db().from("cancelled_slots").update({ status: "open" }).eq("id", slotId).eq("status", "processing");
       }
-
-      return vapiSuccess(toolCallId, 'declined')
+      return vapiSay(toolCallId, "declined");
     }
 
-    return vapiSuccess(toolCallId, 'acknowledged')
-
+    return vapiSay(toolCallId, "acknowledged");
   } catch (err) {
-    console.error('[waitlist-outcome] Error:', err)
-    return vapiError(toolCallId, 'System error.')
+    console.error("[waitlist-outcome] error:", err);
+    return vapiSay(toolCallId, "System error.");
   }
 }

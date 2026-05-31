@@ -1,128 +1,89 @@
-import { NextRequest, NextResponse } from 'next/server'
+// ============================================================================
+// POST /api/vapi/waitlist — add a caller to the waitlist.
+// Faithful v2 port: dedup against active entries, parse spoken "Monday and
+// Wednesday" into the consolidated preferred_days int[] (v2 dropped the
+// redundant preferred_day_numbers / preferred_time_of_day columns).
+// ============================================================================
+import { NextRequest, NextResponse } from "next/server";
+import { db } from "@/lib/supabase";
+import { resolveClinic } from "@/lib/clinic";
+import { extractToolCall, vapiSay, checkRateLimit } from "@/lib/vapi";
+import { normalizePhone } from "@/lib/phone";
+import { WaitlistSchema } from "@/lib/validators";
+import { CADENCE } from "@/config/app";
 
-export const dynamic = 'force-dynamic'
-import { supabase } from '@/lib/supabase'
-import { resolveClinic } from '@/lib/clinic'
-import { vapiSuccess, vapiError, extractToolCall } from '@/lib/vapi'
-import { formatPhone } from '@/lib/phone'
-import { WaitlistSchema } from '@/lib/validators'
+export const dynamic = "force-dynamic";
+
+const DAY_NUM: Record<string, number> = {
+  sunday: 7, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6,
+};
+
+function parseDays(spoken?: string): number[] {
+  if (!spoken) return [];
+  const lower = spoken.toLowerCase();
+  const nums: number[] = [];
+  for (const [name, n] of Object.entries(DAY_NUM)) if (lower.includes(name)) nums.push(n);
+  return nums;
+}
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
-  let toolCallId = 'unknown'
-
+  let toolCallId = "unknown";
   try {
-    const body = await req.json() as Record<string, unknown>
-    const tool = extractToolCall(body)
+    const body = (await req.json()) as Record<string, unknown>;
+    const tool = extractToolCall(body);
+    if (!tool) return vapiSay("unknown", "I'm having trouble with our system. Please call us directly.");
+    toolCallId = tool.toolCallId;
 
-    if (!tool) {
-      return NextResponse.json({
-        results: [{ toolCallId: 'unknown', result: 'I am having trouble with our system. Please call us directly.' }]
-      })
-    }
+    const rl = checkRateLimit(`waitlist:${tool.toNumber ?? toolCallId}`);
+    if (!rl.allowed) return vapiSay(toolCallId, "I'm having trouble right now. Please call us directly.");
 
-    toolCallId = tool.toolCallId
+    const parsed = WaitlistSchema.safeParse(tool.args);
+    if (!parsed.success) return vapiSay(toolCallId, "Could I get your name and phone number to add you to the waitlist?");
 
-    const validation = WaitlistSchema.safeParse(tool.args)
-    if (!validation.success) {
-      return vapiError(toolCallId, 'Could I get your name and phone number to add you to the waitlist?')
-    }
+    const { patientName, patientPhone, service, preferredDays, preferredTimes } = parsed.data;
+    const phone = normalizePhone(patientPhone);
+    if (!phone) return vapiSay(toolCallId, "I couldn't read that phone number. Could you repeat it?");
 
-    const { patientName, patientPhone, service, preferredDays, preferredTimes } = validation.data
+    const clinic = await resolveClinic(tool.clinicId, tool.toNumber);
+    if (!clinic) return vapiSay(toolCallId, "I'm having trouble with our system. Please call us directly.");
 
-    const phone = formatPhone(patientPhone)
-    if (!phone) {
-      return vapiError(toolCallId, 'I could not verify that phone number. Could you repeat it?')
-    }
-
-    const clinic = await resolveClinic(tool.clinicId, tool.toNumber)
-    if (!clinic) {
-      return vapiError(toolCallId, 'I am having trouble with our system. Please call us directly.')
-    }
-
-    // ── DEDUPLICATION CHECK ───────────────────────────────────────
-    // Check waiting AND called — patient may have missed a call
-    // but is still actively on the waitlist
-    const { data: existing } = await supabase
-      .from('waitlist')
-      .select('id, status, service')
-      .eq('clinic_id', clinic.id)
-      .eq('phone', phone)
-      .in('status', ['waiting', 'called'])
-      .is('deleted_at', null)
+    // Dedup: already on the list (waiting or just offered)?
+    const { data: existing } = await db()
+      .from("waitlist")
+      .select("id, status, service")
+      .eq("clinic_id", clinic.id)
+      .eq("phone", phone)
+      .in("status", ["waiting", "offered"])
+      .is("deleted_at", null)
       .limit(1)
-      .maybeSingle()
+      .maybeSingle();
 
     if (existing) {
-      const statusMsg = existing.status === 'called'
-        ? 'We actually just tried to reach you about an opening!'
-        : 'You are already on our waitlist!'
-
-      return vapiSuccess(
-        toolCallId,
-        `${statusMsg} We will call you as soon as a ${existing.service || 'slot'} opens up. Is there anything else I can help you with?`
-      )
+      const msg = existing.status === "offered"
+        ? "We actually just reached out to you about an opening!"
+        : "You're already on our waitlist!";
+      return vapiSay(toolCallId, `${msg} We'll let you know as soon as a ${existing.service || "slot"} opens up. Anything else?`);
     }
 
-    // ── TIME OF DAY PREFERENCE ────────────────────────────────────
-    let preferredTimeOfDay: string | null = null
-    if (preferredTimes) {
-      const lower = preferredTimes.toLowerCase()
-      if (lower.includes('morning'))        preferredTimeOfDay = 'morning'
-      else if (lower.includes('afternoon')) preferredTimeOfDay = 'afternoon'
-      else if (lower.includes('evening'))   preferredTimeOfDay = 'evening'
-    }
-
-    // ── DAY NUMBER CONVERSION ─────────────────────────────────────
-    // "Monday and Wednesday" → "1,3"
-    // Used by scoring algorithm for better candidate ranking
-    let preferredDayNumbers: string | null = null
-    if (preferredDays) {
-      const lower   = preferredDays.toLowerCase()
-      const dayMap: Record<string, number> = {
-        sunday: 0, monday: 1, tuesday: 2, wednesday: 3,
-        thursday: 4, friday: 5, saturday: 6,
-      }
-      const nums: number[] = []
-      for (const [name, num] of Object.entries(dayMap)) {
-        if (lower.includes(name)) nums.push(num)
-      }
-      if (nums.length > 0) preferredDayNumbers = nums.join(',')
-    }
-
-    // ── INSERT ────────────────────────────────────────────────────
-    const { error } = await supabase
-      .from('waitlist')
-      .insert({
-        clinic_id:             clinic.id,
-        patient_name:          patientName,
-        phone,
-        service:               service || null,
-        preferred_days:        preferredDays || null,
-        preferred_times:       preferredTimes || null,
-        preferred_time_of_day: preferredTimeOfDay,
-        preferred_day_numbers: preferredDayNumbers,
-        status:                'waiting',
-        attempt_count:         0,
-        declined_count:        0,
-        priority:              5,
-        added_at:              new Date().toISOString(),
-        expires_at:            new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
-      })
-
+    const { error } = await db().from("waitlist").insert({
+      clinic_id: clinic.id,
+      patient_name: patientName,
+      phone,
+      service: service || "Teeth cleaning",
+      preferred_days: parseDays(preferredDays),
+      preferred_times: preferredTimes ?? null,
+      status: "waiting",
+      priority: 5,
+    });
     if (error) {
-      console.error('[waitlist] Insert error:', error.message)
-      return vapiError(toolCallId, 'I had trouble adding you to the waitlist. Please call us directly.')
+      console.error("[waitlist] insert error:", error.message);
+      return vapiSay(toolCallId, "I had trouble adding you to the waitlist. Please call us directly.");
     }
 
-    console.log(`[waitlist] Added ${patientName} (${phone}) for ${service || 'any service'} — tod: ${preferredTimeOfDay || 'any'} days: ${preferredDayNumbers || 'any'}`)
-
-    return vapiSuccess(
-      toolCallId,
-      `You are on the waitlist! We will call you as soon as a ${service || 'slot'} opens up. Is there anything else I can help you with?`
-    )
-
+    void CADENCE.waitlistDefaultExpiryDays; // expiry default handled by DB column
+    return vapiSay(toolCallId, `You're on the waitlist! We'll reach out as soon as a ${service || "slot"} opens up. Anything else I can help with?`);
   } catch (err) {
-    console.error('[waitlist] Unhandled error:', err)
-    return vapiError(toolCallId, 'I am having some trouble. Please call us directly.')
+    console.error("[waitlist] unhandled:", err);
+    return vapiSay(toolCallId, "I'm having some trouble. Please call us directly.");
   }
 }

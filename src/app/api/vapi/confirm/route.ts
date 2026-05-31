@@ -1,36 +1,40 @@
-import { NextRequest, NextResponse } from 'next/server'
+// ============================================================================
+// POST /api/vapi/confirm — caller confirms they'll attend.
+// v1 only bumped updated_at (didn't actually record confirmation). v2 sets the
+// real lifecycle state: status -> 'confirmed', confirmed_at -> now. This makes
+// "today_confirmed" on the dashboard meaningful and drives reminder logic.
+// ============================================================================
+import { NextRequest, NextResponse } from "next/server";
+import { db } from "@/lib/supabase";
+import { resolveClinic } from "@/lib/clinic";
+import { extractToolCall, vapiSay } from "@/lib/vapi";
+import { normalizePhone } from "@/lib/phone";
+import { findNextBooking } from "@/lib/lookup";
 
-export const dynamic = 'force-dynamic'
-import { supabase } from '@/lib/supabase'
-import { resolveClinic } from '@/lib/clinic'
-import { vapiSuccess, extractToolCall } from '@/lib/vapi'
-import { formatPhone } from '@/lib/phone'
+export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
   try {
-    const body = await req.json() as Record<string, unknown>
-    const tool = extractToolCall(body)
+    const body = (await req.json()) as Record<string, unknown>;
+    const tool = extractToolCall(body);
+    if (!tool) return vapiSay("unknown", "Perfect — we'll see you then!");
 
-    if (!tool) {
-      return NextResponse.json({ results: [{ toolCallId: 'unknown', result: 'Perfect — we will see you then!' }] })
-    }
-
-    const phone  = formatPhone(tool.args.patientPhone || '')
-    const clinic = await resolveClinic(tool.clinicId, tool.toNumber)
+    const phone = normalizePhone(tool.args.patientPhone ?? "");
+    const clinic = await resolveClinic(tool.clinicId, tool.toNumber);
 
     if (phone && clinic) {
-      await supabase
-        .from('bookings')
-        .update({ updated_at: new Date().toISOString() })
-        .eq('clinic_id', clinic.id)
-        .eq('phone', phone)
-        .eq('status', 'Confirmed')
-        .gte('date', new Date().toISOString().split('T')[0])
+      const booking = await findNextBooking(clinic.id, phone);
+      if (booking && booking.status !== "confirmed") {
+        await db()
+          .from("bookings")
+          .update({ status: "confirmed", confirmed_at: new Date().toISOString() })
+          .eq("id", booking.id);
+      }
     }
 
-    return vapiSuccess(tool.toolCallId, 'Perfect — we will see you then! Have a great day.')
+    return vapiSay(tool.toolCallId, "Perfect — we'll see you then. Have a great day!");
   } catch (err) {
-    console.error('[confirm] Error:', err)
-    return NextResponse.json({ results: [{ toolCallId: 'unknown', result: 'Perfect — we will see you then!' }] })
+    console.error("[confirm] error:", err);
+    return vapiSay("unknown", "Perfect — we'll see you then!");
   }
 }

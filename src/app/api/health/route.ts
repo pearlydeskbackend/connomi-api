@@ -1,27 +1,22 @@
-import { NextResponse } from 'next/server'
+// ============================================================================
+// GET /api/health — liveness + readiness. Config is validated centrally by
+// env() at boot, so here we verify the process is up and the database is
+// reachable (a real readiness signal, not just "are env vars present").
+// ============================================================================
+import { NextResponse } from "next/server";
+import { db } from "@/lib/supabase";
 
-export const dynamic = 'force-dynamic'
+export const dynamic = "force-dynamic";
 
-export async function GET() {
-  const checks = {
-    NEXT_PUBLIC_SUPABASE_URL:    !!process.env.NEXT_PUBLIC_SUPABASE_URL,
-    SUPABASE_SERVICE_KEY:        !!process.env.SUPABASE_SERVICE_KEY,
-    TWILIO_ACCOUNT_SID:         !!process.env.TWILIO_ACCOUNT_SID,
-    TWILIO_AUTH_TOKEN:          !!process.env.TWILIO_AUTH_TOKEN,
-    TWILIO_PHONE_NUMBER:        !!process.env.TWILIO_PHONE_NUMBER,
-    VAPI_API_KEY:               !!process.env.VAPI_API_KEY,
-    VAPI_PHONE_NUMBER_ID:       !!process.env.VAPI_PHONE_NUMBER_ID,
-    VAPI_TEMPLATE_ASSISTANT_ID: !!process.env.VAPI_TEMPLATE_ASSISTANT_ID,
-    CRON_SECRET:                !!process.env.CRON_SECRET,
-    ADMIN_SECRET:               !!process.env.ADMIN_SECRET,
+export async function GET(): Promise<NextResponse> {
+  try {
+    // cheap connectivity probe
+    const { error } = await db().from("clinics").select("id").limit(1);
+    if (error) {
+      return NextResponse.json({ status: "degraded", db: "error", detail: error.message }, { status: 503 });
+    }
+    return NextResponse.json({ status: "ok", db: "ok", ts: new Date().toISOString() });
+  } catch (err) {
+    return NextResponse.json({ status: "down", detail: String(err) }, { status: 503 });
   }
-
-  const missing = Object.entries(checks)
-    .filter(([, isSet]) => !isSet)
-    .map(([key]) => key)
-
-  return NextResponse.json(
-    { status: missing.length === 0 ? 'ok' : 'missing_config', missing, checks },
-    { status: missing.length === 0 ? 200 : 500 }
-  )
 }

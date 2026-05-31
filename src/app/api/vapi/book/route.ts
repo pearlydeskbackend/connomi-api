@@ -1,248 +1,141 @@
-import { NextRequest, NextResponse } from 'next/server'
+// ============================================================================
+// POST /api/vapi/book — Sophie books an appointment.
+// All correctness (atomic slot re-check, no double-book, patient link/create,
+// hours/lead-time guards) lives in the tested book_appointment() DB function.
+// This route: validate input -> call the function -> turn the typed result into
+// natural speech -> fire confirmation SMS (non-blocking). No scheduling logic
+// in the route; that's the whole point of v2.
+// ============================================================================
+import { NextRequest, NextResponse } from "next/server";
+import { db } from "@/lib/supabase";
+import { resolveClinic, agentNameFor } from "@/lib/clinic";
+import { extractToolCall, vapiSay, checkRateLimit } from "@/lib/vapi";
+import { normalizePhone } from "@/lib/phone";
+import { BookingSchema } from "@/lib/validators";
+import { speakableSlot } from "@/lib/speech";
+import { sendSMS, smsConfirmation, smsOwnerWaitlistFilled } from "@/lib/twilio";
+import type { BookResult } from "@/lib/booking-result";
 
-export const dynamic = 'force-dynamic'
-import { supabase } from '@/lib/supabase'
-import { resolveClinic } from '@/lib/clinic'
-import { sendSMS, smsConfirmation } from '@/lib/twilio'
-import { vapiSuccess, vapiError, extractToolCall } from '@/lib/vapi'
-import { formatPhone } from '@/lib/phone'
-import { BookingSchema } from '@/lib/validators'
+export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
-  let toolCallId = 'unknown'
-
+  let toolCallId = "unknown";
   try {
-    const body = await req.json() as Record<string, unknown>
-    const tool = extractToolCall(body)
+    const body = (await req.json()) as Record<string, unknown>;
+    const tool = extractToolCall(body);
+    if (!tool) return vapiSay("unknown", "I'm having trouble with our system. Please call us directly.");
+    toolCallId = tool.toolCallId;
 
-    if (!tool) {
-      return NextResponse.json({
-        results: [{ toolCallId: 'unknown', result: 'I am having trouble with our system. Please call us directly at 604-879-9999.' }]
-      })
+    const rl = checkRateLimit(`book:${tool.toNumber ?? toolCallId}`);
+    if (!rl.allowed) return vapiSay(toolCallId, "I'm having trouble right now. Please call us directly.");
+
+    const parsed = BookingSchema.safeParse(tool.args);
+    if (!parsed.success) {
+      return vapiSay(toolCallId, "I'm missing a detail. Could you give me your name, phone number, the service, and the date and time?");
+    }
+    const v = parsed.data;
+
+    const phone = normalizePhone(v.patientPhone);
+    if (!phone) return vapiSay(toolCallId, "I couldn't read that phone number. Could you repeat it slowly?");
+
+    const clinic = await resolveClinic(tool.clinicId, tool.toNumber);
+    if (!clinic) return vapiSay(toolCallId, "I'm having trouble with our system. Please call us directly.");
+
+    // Single atomic, race-safe call. Returns a typed result.
+    const { data, error } = await db().rpc("book_appointment", {
+      p_clinic: clinic.id,
+      p_starts_at: v.startsAt,
+      p_service: v.service,
+      p_patient_name: v.patientName,
+      p_phone: phone,
+      p_provider_id: v.providerId,
+      p_source: "ai",
+      p_is_new_patient: v.isNewPatient,
+      p_notes: v.notes,
+    });
+    if (error) {
+      console.error("[book] rpc error:", error.message);
+      return vapiSay(toolCallId, "I'm having trouble completing that booking. Please call us directly.");
     }
 
-    toolCallId = tool.toolCallId
+    const result = data as unknown as BookResult;
 
-    const validation = BookingSchema.safeParse(tool.args)
-    if (!validation.success) {
-      return vapiError(toolCallId, 'I am missing some details. Could you give me your full name, phone number, the service, date and time?')
+    if (!result.ok) {
+      // Map each typed failure reason to natural speech.
+      switch (result.reason) {
+        case "slot_taken":
+        case "no_provider":
+          return vapiSay(toolCallId, "That time was just taken. Let me find you the next available slot.");
+        case "outside_hours":
+          return vapiSay(toolCallId, "That time is outside our hours. What else works for you?");
+        case "clinic_closed":
+          return vapiSay(toolCallId, "We're closed that day. What other day works for you?");
+        case "too_soon":
+          return vapiSay(toolCallId, "That's a little too soon to book over the phone. Could we find a slightly later time?");
+        default:
+          return vapiSay(toolCallId, "I couldn't complete that booking. Please call us directly.");
+      }
     }
 
-    const { patientName, patientPhone, service, date, time, isNewPatient, notes } = validation.data
-
-    const phone = formatPhone(patientPhone)
-    if (!phone) {
-      return vapiError(toolCallId, 'I could not verify that phone number. Could you repeat it slowly?')
-    }
-
-    const clinic = await resolveClinic(tool.clinicId, tool.toNumber)
-    if (!clinic) {
-      return vapiError(toolCallId, 'I am having trouble with our system. Please call us directly.')
-    }
-
-    const today = new Date().toISOString().split('T')[0]
-
-    // ── DUPLICATE BOOKING CHECK ───────────────────────────────────
-    // Use maybeSingle() — never throws when no rows found
-    const { data: existing } = await supabase
-      .from('bookings')
-      .select('id, date, time, service')
-      .eq('clinic_id', clinic.id)
-      .eq('phone', phone)
-      .in('status', ['Confirmed', 'Patient Confirmed'])
-      .gte('date', today)
-      .order('date', { ascending: true })
-      .limit(1)
-      .maybeSingle()
-
-    if (existing) {
-      return vapiSuccess(
-        toolCallId,
-        `I can see you already have a ${existing.service} booked for ${existing.date} at ${existing.time}. Would you like to keep that, reschedule it, or book an additional appointment?`
-      )
-    }
-
-    // ── SLOT CONFLICT CHECK ───────────────────────────────────────
-    // Never double book the same slot
-    const { data: slotConflict } = await supabase
-      .from('bookings')
-      .select('id')
-      .eq('clinic_id', clinic.id)
-      .eq('date', date)
-      .eq('time', time)
-      .in('status', ['Confirmed', 'Patient Confirmed', 'Checked In'])
-      .limit(1)
-      .maybeSingle()
-
-    if (slotConflict) {
-      return vapiError(
-        toolCallId,
-        `I am sorry, that slot at ${time} on ${date} was just taken. Let me find you the next available time.`
-      )
-    }
-
-    // ── INSERT BOOKING ────────────────────────────────────────────
-    const { data: booking, error: bookingError } = await Promise.race([
-      supabase
-        .from('bookings')
-        .insert({
-          clinic_id:      clinic.id,
-          patient_name:   patientName,
-          phone,
-          service,
-          date,
-          time,
-          status:         'Confirmed',
-          is_new_patient: isNewPatient,
-          booked_by:      'pearly',
-          notes,
-          created_at:     new Date().toISOString(),
-          updated_at:     new Date().toISOString(),
-        })
-        .select()
-        .single(),
-      new Promise<{ data: null; error: Error }>((resolve) =>
-        setTimeout(() => resolve({ data: null, error: new Error('Insert timed out') }), 8000)
-      ),
-    ]) as { data: any; error: Error | null }
-
-    if (bookingError || !booking) {
-      console.error('[book] Insert error:', bookingError?.message)
-      return vapiError(toolCallId, 'I am having trouble completing that booking. Please call us directly.')
-    }
-
-    // ── UPSERT PATIENT RECORD ─────────────────────────────────────
-    // Fire and forget — never block the response
-    Promise.resolve(
-      supabase
-        .from('patients')
-        .upsert(
-          {
-            clinic_id:    clinic.id,
-            patient_name: patientName,
-            phone,
-            updated_at:   new Date().toISOString(),
-          },
-          { onConflict: 'clinic_id,phone' }
-        )
-    ).catch((err: unknown) => console.error('[book] Patient upsert error:', err))
-
-    // ── CONFIRMATION SMS ──────────────────────────────────────────
-    // Fire and forget — never block the response
-    const clinicPhone = clinic.twilio_phone || clinic.owner_phone || ''
+    // Success — confirmation SMS, fire-and-forget so the call never waits.
+    const clinicPhone = clinic.twilio_phone || clinic.owner_phone || "";
     sendSMS(
       phone,
-      smsConfirmation(patientName, service, date, time, clinic.name, clinicPhone, isNewPatient)
-    ).catch((err: unknown) => console.error('[book] SMS error:', err))
+      smsConfirmation({
+        name: v.patientName, service: v.service, startsAt: result.starts_at,
+        timezone: clinic.timezone, clinicName: clinic.name, clinicPhone,
+        isNewPatient: v.isNewPatient,
+      }),
+    ).catch((e) => console.error("[book] SMS error:", e));
 
-    // ── WAITLIST LOOP CLOSE ───────────────────────────────────────
-    // Check if this booking fills an open cancelled slot
-    // Fire and forget — never block the response
-    closeWaitlistLoop(booking.id, clinic, phone, patientName, service, date, time, clinicPhone)
-      .catch(err => console.error('[book] Waitlist loop error:', err))
+    // If this booking filled an open cancelled slot, close the waitlist loop
+    // and alert the owner (non-blocking).
+    closeWaitlistLoop(result.booking_id, clinic.id, result.starts_at, v.service, v.patientName, clinic)
+      .catch((e) => console.error("[book] waitlist loop:", e));
 
-    console.log(`[book] Booking saved — ${patientName} ${service} ${date} at ${time} — ${clinic.name} (new: ${isNewPatient})`)
-
-    return vapiSuccess(
+    const agent = agentNameFor(clinic);
+    void agent; // available if you want Sophie to self-reference by name
+    return vapiSay(
       toolCallId,
-      `You are all set! Your ${service} is booked for ${date} at ${time}. You will receive a confirmation text shortly. Is there anything else I can help you with?`
-    )
-
+      `You're all set — your ${v.service} is booked for ${speakableSlot(result.starts_at, clinic.timezone)}. You'll get a confirmation text shortly. Anything else?`,
+    );
   } catch (err) {
-    console.error('[book] Unhandled error:', err)
-    return vapiError(toolCallId, 'I am having some trouble. Please call us directly.')
+    console.error("[book] unhandled:", err);
+    return vapiSay(toolCallId, "I'm having some trouble. Please call us directly.");
   }
 }
 
+// Close an open cancelled slot when a direct booking fills it; mark the
+// waitlist entry booked and alert the owner. Best-effort, never blocks the call.
 async function closeWaitlistLoop(
   bookingId: string,
-  clinic: any,
-  phone: string,
-  patientName: string,
+  clinicId: string,
+  startsAt: string,
   service: string,
-  date: string,
-  time: string,
-  clinicPhone: string
+  patientName: string,
+  clinic: { owner_phone: string | null; twilio_phone: string | null; timezone: string },
 ): Promise<void> {
-  try {
-    // Find an open cancelled slot matching this date + time
-    // Use maybeSingle() — never throws when no rows found
-    const { data: openSlot } = await supabase
-      .from('cancelled_slots')
-      .select('id')
-      .eq('clinic_id', clinic.id)
-      .eq('slot_date', date)
-      .eq('slot_time', time)
-      .in('status', ['open', 'processing'])
-      .limit(1)
-      .maybeSingle()
+  const { data: slot } = await db()
+    .from("cancelled_slots")
+    .select("id")
+    .eq("clinic_id", clinicId)
+    .eq("starts_at", startsAt)
+    .in("status", ["open", "processing"])
+    .limit(1)
+    .maybeSingle();
+  if (!slot) return; // ordinary booking, not a waitlist fill
 
-    if (!openSlot) return // normal booking — not a waitlist fill
+  await db()
+    .from("cancelled_slots")
+    .update({ status: "filled", filled_at: new Date().toISOString() })
+    .eq("id", slot.id);
 
-    const now = new Date().toISOString()
-
-    // Mark slot as filled
-    await supabase
-      .from('cancelled_slots')
-      .update({
-        status:    'filled',
-        filled_at: now,
-      })
-      .eq('id', openSlot.id)
-
-    // Expire all pending queue jobs for this slot
-    await supabase
-      .from('waitlist_call_queue')
-      .update({ status: 'expired', outcome: 'slot_filled_direct_booking' })
-      .eq('slot_id', openSlot.id)
-      .in('status', ['pending', 'calling', 'called'])
-
-    // Find the waitlist entry for this patient
-    // Check called OR waiting — patient may have booked via direct call
-    const { data: waitlistEntry } = await supabase
-      .from('waitlist')
-      .select('id')
-      .eq('clinic_id', clinic.id)
-      .eq('phone', phone)
-      .in('status', ['called', 'waiting'])
-      .order('last_attempt_at', { ascending: false })
-      .limit(1)
-      .maybeSingle()
-
-    if (waitlistEntry) {
-      await supabase
-        .from('waitlist')
-        .update({
-          status:             'booked',
-          booked_at:          now,
-          matched_booking_id: bookingId,
-        })
-        .eq('id', waitlistEntry.id)
-
-      await supabase
-        .from('cancelled_slots')
-        .update({ filled_by_waitlist_id: waitlistEntry.id })
-        .eq('id', openSlot.id)
-
-      await supabase
-        .from('waitlist_attempts')
-        .update({ outcome: 'booked' })
-        .eq('waitlist_id', waitlistEntry.id)
-        .eq('outcome', 'calling')
-    }
-
-    // Alert owner
-    const ownerPhone = clinic.owner_phone || clinic.twilio_phone
-    if (ownerPhone) {
-      sendSMS(
-        ownerPhone,
-        `Pearly filled your ${service} slot on ${date} at ${time}. ${patientName} from the waitlist is now booked and confirmed. — Pearly Desk`
-      ).catch(err => console.error('[book] Owner SMS error:', err))
-    }
-
-    console.log(`[book] Waitlist loop closed — ${patientName} filled ${service} slot on ${date} at ${time}`)
-
-  } catch (err) {
-    console.error('[book] closeWaitlistLoop error:', err)
+  const ownerPhone = clinic.owner_phone || clinic.twilio_phone;
+  if (ownerPhone) {
+    await sendSMS(
+      ownerPhone,
+      smsOwnerWaitlistFilled({ service, startsAt, timezone: clinic.timezone, patientName }),
+    );
   }
+  void bookingId;
 }

@@ -1,90 +1,64 @@
-import { supabase } from '@/lib/supabase'
-import type { Clinic } from '@/lib/supabase'
+// ============================================================================
+// lib/clinic.ts — resolve which clinic a call belongs to. Same proven
+// multi-strategy approach as v1 (explicit id -> phone -> single-clinic
+// fallback), now on the typed client. Reads agent_name etc. via the row type.
+// ============================================================================
+import { db, type Clinic } from "@/lib/supabase";
+import { normalizePhone } from "@/lib/phone";
+import { BRAND } from "@/config/app";
 
 export async function getClinicById(id: string): Promise<Clinic | null> {
-  const { data, error } = await supabase
-    .from('clinics')
-    .select('*')
-    .eq('id', id)
-    .eq('active', true)
-    .single()
-
+  const { data, error } = await db()
+    .from("clinics")
+    .select("*")
+    .eq("id", id)
+    .eq("active", true)
+    .maybeSingle();
   if (error) {
-    console.error('[clinic] getClinicById error:', error.message)
-    return null
+    console.error("[clinic] getClinicById:", error.message);
+    return null;
   }
-  return data
+  return data;
 }
 
 export async function getClinicByPhone(phone: string): Promise<Clinic | null> {
-  // Normalize the phone number before lookup
-  // Try the exact number first, then with +1 prefix, then without
-  const attempts = [
-    phone,
-    phone.startsWith('+') ? phone : `+${phone}`,
-    phone.startsWith('+1') ? phone.slice(2) : phone,
-    phone.replace(/\D/g, ''),
-    `+1${phone.replace(/\D/g, '').slice(-10)}`,
-  ]
-
-  console.log('[clinic] Trying phone lookups:', attempts)
-
+  // try a few canonical forms; normalizePhone gives the primary E.164 form
+  const canonical = normalizePhone(phone);
+  const attempts = Array.from(
+    new Set([canonical, phone, phone.replace(/\D/g, "")].filter(Boolean) as string[]),
+  );
   for (const attempt of attempts) {
-    const { data, error } = await supabase
-      .from('clinics')
-      .select('*')
-      .eq('twilio_phone', attempt)
-      .eq('active', true)
-      .single()
-
-    if (!error && data) {
-      console.log('[clinic] Found clinic with phone attempt:', attempt)
-      return data
-    }
+    const { data } = await db()
+      .from("clinics")
+      .select("*")
+      .eq("twilio_phone", attempt)
+      .eq("active", true)
+      .maybeSingle();
+    if (data) return data;
   }
-
-  console.error('[clinic] No clinic found for any phone format of:', phone)
-  return null
+  return null;
 }
 
 export async function resolveClinic(
   clinicId: string | null,
-  toNumber: string | null
+  toNumber: string | null,
 ): Promise<Clinic | null> {
-  console.log('[clinic] resolveClinic called — clinicId:', clinicId, 'toNumber:', toNumber)
-
-  // Method 1 — explicit clinic_id
   if (clinicId) {
-    const clinic = await getClinicById(clinicId)
-    if (clinic) {
-      console.log('[clinic] Resolved by ID:', clinic.name)
-      return clinic
-    }
-    console.warn('[clinic] ID not found — trying phone fallback')
+    const c = await getClinicById(clinicId);
+    if (c) return c;
   }
-
-  // Method 2 — phone number lookup
   if (toNumber) {
-    const clinic = await getClinicByPhone(toNumber)
-    if (clinic) {
-      console.log('[clinic] Resolved by phone:', clinic.name)
-      return clinic
-    }
+    const c = await getClinicByPhone(toNumber);
+    if (c) return c;
   }
+  // last resort: if exactly one active clinic exists, it's that one
+  const { data } = await db().from("clinics").select("*").eq("active", true);
+  if (data && data.length === 1) return data[0];
+  console.error("[clinic] could not resolve clinic", { clinicId, toNumber });
+  return null;
+}
 
-  // Method 3 — FALLBACK: if only one clinic exists return it
-  // This handles the case where Vapi does not send phone number correctly
-  console.log('[clinic] Trying fallback — checking if only one active clinic exists')
-  const { data: allClinics } = await supabase
-    .from('clinics')
-    .select('*')
-    .eq('active', true)
-
-  if (allClinics && allClinics.length === 1) {
-    console.log('[clinic] Single clinic fallback:', allClinics[0].name)
-    return allClinics[0]
-  }
-
-  console.error('[clinic] Could not resolve clinic')
-  return null
+/** the name this clinic's receptionist introduces herself with */
+export function agentNameFor(clinic: Clinic): string {
+  return clinic.agent_name?.trim() || BRAND.agentName;
 }

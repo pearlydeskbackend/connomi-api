@@ -1,185 +1,151 @@
-import { NextRequest, NextResponse } from 'next/server'
+// ============================================================================
+// POST /api/vapi/end-of-call — Vapi server webhook (not a tool call).
+// Two message types:
+//   status-update      -> track active_calls (drives the live dashboard feed)
+//   end-of-call-report -> log the call, alert owner if unresolved, send recall
+//                         follow-up SMS when a recall call went unanswered.
+// Idempotent: a duplicate end-of-call-report for the same call_id is ignored.
+// ============================================================================
+import { NextRequest, NextResponse } from "next/server";
+import { db } from "@/lib/supabase";
+import { resolveClinic } from "@/lib/clinic";
+import { env } from "@/config/env";
+import { sendSMS, smsRecallFollowUp, smsRecallFinal } from "@/lib/twilio";
+import type { Enums } from "@/lib/database.types";
 
-export const dynamic = 'force-dynamic'
-import { supabase } from '@/lib/supabase'
-import { resolveClinic } from '@/lib/clinic'
-import { sendSMS, smsRecallFollowUp, smsRecallFinal } from '@/lib/twilio'
+export const dynamic = "force-dynamic";
 
-const NO_ANSWER_REASONS = [
-  'voicemail','no-answer','no_answer','busy','failed',
-  'machine-detected','machine-start-of-speech-detected',
-  'customer-did-not-answer','customer_did_not_answer',
-]
+const NO_ANSWER = [
+  "voicemail", "no-answer", "no_answer", "busy", "failed",
+  "machine-detected", "machine-start-of-speech-detected",
+  "customer-did-not-answer", "customer_did_not_answer",
+];
+
+const ok = () => NextResponse.json({ received: true });
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
   try {
-    const body    = await req.json() as Record<string, unknown>
-    const message = body?.message as Record<string, unknown> | undefined
+    const body = (await req.json()) as Record<string, unknown>;
+    const message = body?.message as Record<string, unknown> | undefined;
+    if (!message) return ok();
+    const type = message.type as string;
 
-    if (!message) return NextResponse.json({ received: true })
+    // ---- status-update: maintain the live active_calls feed ----
+    if (type === "status-update") {
+      const status = message.status as string;
+      const call = message.call as Record<string, unknown> | undefined;
+      if (!call) return ok();
 
-    const messageType = message.type as string
+      const callId = call.id as string;
+      const toNumber = (call.phoneNumber as Record<string, unknown>)?.number as string | undefined;
+      const customerPhone = (call.customer as Record<string, unknown>)?.number as string | undefined;
+      const clinicId = (call.metadata as Record<string, string> | undefined)?.clinic_id ?? null;
 
-    // ── HANDLE STATUS-UPDATE (call started / ended) ────────────────────
-    // Vapi sends this when a call begins (status: in-progress) or ends
-    if (messageType === 'status-update') {
-      const status = message.status as string
-      const call   = message.call as Record<string, unknown> | undefined
-      if (!call) return NextResponse.json({ received: true })
+      const clinic = await resolveClinic(clinicId, toNumber ?? null);
+      if (!clinic) return ok();
 
-      const callId        = call.id as string
-      const phoneObj      = call.phoneNumber as Record<string, unknown> | undefined
-      const toNumber      = phoneObj?.number as string | null ?? null
-      const customerPhone = (call.customer as Record<string, unknown>)?.number as string ?? ''
-      const metadata      = call.metadata as Record<string, string> | undefined
-      const clinicId      = metadata?.clinic_id ?? null
-
-      let resolvedClinicId = clinicId
-      if (!resolvedClinicId && toNumber) {
-        const { data } = await supabase
-          .from('clinics').select('id').eq('twilio_phone', toNumber).single()
-        resolvedClinicId = data?.id ?? null
+      if (status === "in-progress") {
+        await db().from("active_calls").upsert(
+          {
+            call_id: callId,
+            clinic_id: clinic.id,
+            phone: customerPhone ?? null,
+            state: "active" as Enums<"call_state">,
+          },
+          { onConflict: "call_id" },
+        );
+      } else if (status === "ended") {
+        await db().from("active_calls")
+          .update({ state: "ended" as Enums<"call_state">, ended_at: new Date().toISOString() })
+          .eq("call_id", callId);
       }
-
-      if (!resolvedClinicId) return NextResponse.json({ received: true })
-
-      if (status === 'in-progress') {
-        // Upsert active call — dashboard realtime picks this up → triggers mood state
-        await supabase.from('active_calls').upsert({
-          call_id:    callId,
-          clinic_id:  resolvedClinicId,
-          phone:      customerPhone || null,
-          started_at: new Date().toISOString(),
-          status:     'active',
-        }, { onConflict: 'call_id' })
-        console.log(`[status-update] Call started: ${callId}`)
-      }
-
-      if (status === 'ended') {
-        await supabase.from('active_calls')
-          .update({ status: 'ended', ended_at: new Date().toISOString() })
-          .eq('call_id', callId)
-        console.log(`[status-update] Call ended: ${callId}`)
-      }
-
-      return NextResponse.json({ received: true })
+      return ok();
     }
 
-    // ── HANDLE END-OF-CALL-REPORT ──────────────────────────────────────
-    if (messageType !== 'end-of-call-report') {
-      return NextResponse.json({ received: true })
-    }
+    // ---- end-of-call-report ----
+    if (type !== "end-of-call-report") return ok();
 
-    const analysis       = message.analysis as Record<string, unknown> | undefined
-    const structuredData = analysis?.structuredData as Record<string, string> | undefined
-    const call           = message.call as Record<string, unknown> | undefined
-    const metadata       = call?.metadata as Record<string, string> | undefined
-    const clinicId       = metadata?.clinic_id || null
-    const phoneObj       = call?.phoneNumber as Record<string, unknown> | undefined
-    const toNumber       = phoneObj?.number as string | null || null
-    const endedReason    = message.endedReason as string || 'unknown'
-    const assistantId    = call?.assistantId as string || ''
-    const customerPhone  = (call?.customer as Record<string, unknown>)?.number as string || ''
-    const callId         = (message.id ?? call?.id) as string | null || null
-    const direction      = (call?.type as string) === 'outboundPhoneCall' ? 'outbound' : 'inbound'
+    const analysis = message.analysis as Record<string, unknown> | undefined;
+    const structured = analysis?.structuredData as Record<string, string> | undefined;
+    const call = message.call as Record<string, unknown> | undefined;
+    const clinicId = (call?.metadata as Record<string, string> | undefined)?.clinic_id ?? null;
+    const toNumber = (call?.phoneNumber as Record<string, unknown> | undefined)?.number as string | undefined;
+    const endedReason = (message.endedReason as string) || "unknown";
+    const assistantId = (call?.assistantId as string) || "";
+    const customerPhone = (call?.customer as Record<string, unknown> | undefined)?.number as string | undefined;
+    const callId = ((message.id ?? call?.id) as string) || null;
+    const direction: Enums<"call_direction"> =
+      (call?.type as string) === "outboundPhoneCall" ? "outbound" : "inbound";
 
-    const clinic  = await resolveClinic(clinicId, toNumber)
-    const outcome = structuredData?.callOutcome || 'unknown'
-    const summary = analysis?.summary as string || ''
+    const clinic = await resolveClinic(clinicId, toNumber ?? null);
+    const outcome = structured?.callOutcome || "unknown";
+    const summary = (analysis?.summary as string) || "";
 
-    // Look up patient name from phone
-    let patientName: string | null = null
-    if (customerPhone && clinic?.id) {
-      const { data: patient } = await supabase
-        .from('patients').select('patient_name')
-        .eq('clinic_id', clinic.id).eq('phone', customerPhone).maybeSingle()
-      patientName = patient?.patient_name ?? null
-    }
-
-    console.log(`[end-of-call] endedReason: ${endedReason} customer: ${customerPhone} callId: ${callId}`)
-
-    // ── DUPLICATE PREVENTION ──────────────────────────────────────────
+    // idempotency: skip if this call is already logged
     if (callId) {
-      const { data: existing } = await supabase
-        .from('call_logs').select('id').eq('call_id', callId).maybeSingle()
-      if (existing) {
-        console.log(`[end-of-call] Duplicate webhook for call ${callId} — skipping`)
-        return NextResponse.json({ received: true, duplicate: true })
-      }
+      const { data: dup } = await db().from("call_logs").select("id").eq("call_id", callId).maybeSingle();
+      if (dup) return NextResponse.json({ received: true, duplicate: true });
     }
 
-    // ── LOG CALL ──────────────────────────────────────────────────────
-    const baseLog = {
-      clinic_id:          clinic?.id || null,
-      call_id:            callId,
-      duration_seconds:   (message.durationSeconds as number) || 0,
-      outcome,
-      sentiment:          structuredData?.patientSentiment || 'neutral',
-      confidence:         structuredData?.pearlyConfidence || 'medium',
-      summary,
-      success_evaluation: String(analysis?.successEvaluation || ''),
-      ended_reason:       endedReason,
-      cost_usd:           (message.cost as number) || 0,
-      transcript:         message.transcript as string || '',
-      created_at:         new Date().toISOString(),
+    // resolve patient name from phone (best effort)
+    let patientName: string | null = null;
+    if (customerPhone && clinic) {
+      const { data: p } = await db().from("patients")
+        .select("name").eq("clinic_id", clinic.id).eq("phone", customerPhone).maybeSingle();
+      patientName = p?.name ?? null;
     }
 
-    const { error: logError } = await supabase.from('call_logs').insert({
-      ...baseLog,
-      phone:        customerPhone || null,
-      patient_name: patientName,
+    await db().from("call_logs").insert({
+      clinic_id: clinic?.id ?? "",
+      call_id: callId,
       direction,
-    })
+      patient_name: patientName,
+      phone: customerPhone ?? null,
+      duration_seconds: (message.durationSeconds as number) || 0,
+      outcome,
+      sentiment: structured?.patientSentiment || "neutral",
+      summary,
+      transcript: (message.transcript as string) || "",
+      cost_usd: (message.cost as number) || 0,
+      ended_reason: endedReason,
+    });
 
-    if (logError) {
-      console.warn('[end-of-call] Full insert failed, trying base fields:', logError.message)
-      await supabase.from('call_logs').insert(baseLog)
+    // alert owner on an unresolved call
+    if (outcome === "unresolved" && clinic?.owner_phone && summary) {
+      sendSMS(clinic.owner_phone, `Connomi AI had trouble with a call. Summary: ${summary}. Check your dashboard.`)
+        .catch((e) => console.error("[end-of-call] owner SMS:", e));
     }
 
-    // ── ALERT OWNER ON UNRESOLVED CALLS ───────────────────────────────
-    if (outcome === 'unresolved' && clinic?.owner_phone && summary) {
-      sendSMS(
-        clinic.owner_phone,
-        `⚠️ Pearly had trouble with a call.\n\nSummary: ${summary}\n\nCheck your dashboard for details.`
-      ).catch(err => console.error('[end-of-call] Owner SMS error:', err))
-    }
-
-    // ── RECALL SMS ────────────────────────────────────────────────────
-    const isRecallCall =
+    // recall follow-up SMS when a recall/reengagement call went unanswered
+    const isRecall =
       assistantId === process.env.VAPI_RECALL_ASSISTANT_ID ||
-      assistantId === process.env.VAPI_REENGAGEMENT_ASSISTANT_ID
+      assistantId === process.env.VAPI_REENGAGEMENT_ASSISTANT_ID;
+    const noAnswer = NO_ANSWER.some((r) => endedReason.toLowerCase().includes(r));
 
-    const patientDidNotAnswer = NO_ANSWER_REASONS.some(r =>
-      endedReason.toLowerCase().includes(r.toLowerCase())
-    )
-
-    if (isRecallCall && patientDidNotAnswer && customerPhone && clinic) {
-      const clinicPhone = clinic.twilio_phone || clinic.owner_phone || ''
-      const { data: patient } = await supabase
-        .from('patients').select('patient_name, recall_sequence_step')
-        .eq('clinic_id', clinic.id).eq('phone', customerPhone).maybeSingle()
-
-      if (patient) {
-        const step       = patient.recall_sequence_step ?? 0
-        const isLastStep = step >= 2
-        const smsSent = await sendSMS(
+    if (isRecall && noAnswer && customerPhone && clinic) {
+      const clinicPhone = clinic.twilio_phone || clinic.owner_phone || "";
+      const { data: p } = await db().from("patients")
+        .select("name, recall_sequence_step")
+        .eq("clinic_id", clinic.id).eq("phone", customerPhone).maybeSingle();
+      if (p) {
+        const step = p.recall_sequence_step ?? 0;
+        const sent = await sendSMS(
           customerPhone,
-          isLastStep
-            ? smsRecallFinal(patient.patient_name, clinic.name, clinicPhone)
-            : smsRecallFollowUp(patient.patient_name, clinic.name, clinicPhone, step + 1)
-        )
-        if (smsSent) {
-          await supabase.from('patients')
-            .update({ recall_sms_sent_at: new Date().toISOString() })
-            .eq('clinic_id', clinic.id).eq('phone', customerPhone)
+          step >= 2
+            ? smsRecallFinal({ name: p.name, clinicName: clinic.name, clinicPhone })
+            : smsRecallFollowUp({ name: p.name, clinicName: clinic.name, clinicPhone, step: step + 1 }),
+        );
+        if (sent) {
+          await db().from("patients")
+            .update({ last_contacted_at: new Date().toISOString() })
+            .eq("clinic_id", clinic.id).eq("phone", customerPhone);
         }
       }
     }
 
-    return NextResponse.json({ received: true })
-
+    return ok();
   } catch (err) {
-    console.error('[end-of-call] Error:', err)
-    return NextResponse.json({ received: true })
+    console.error("[end-of-call] error:", err);
+    return ok();
   }
 }

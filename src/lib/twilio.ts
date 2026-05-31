@@ -1,263 +1,169 @@
-// ─── SEND SMS WITH RETRY ──────────────────────────────────────────────────────
-// Retries once on network errors (ECONNRESET, TLS failures)
-// These are transient Vercel → Twilio connection issues — not code bugs
+// ============================================================================
+// lib/twilio.ts — SMS send (retry once on transient network errors) + message
+// templates. Connomi-branded, no hardcoded clinic phone/URL: callers pass the
+// clinic's own values. Templates take an ISO timestamp + timezone and format
+// for the patient's locale, instead of pre-split date/time strings.
+// ============================================================================
+import { env } from "@/config/env";
+import { RETRY, BRAND } from "@/config/app";
 
 export async function sendSMS(to: string, body: string): Promise<boolean> {
-  const accountSid = process.env.TWILIO_ACCOUNT_SID
-  const authToken  = process.env.TWILIO_AUTH_TOKEN
-  const fromNumber = process.env.TWILIO_PHONE_NUMBER
-
-  if (!accountSid || !authToken || !fromNumber) {
-    console.error('[twilio] Missing env vars')
-    return false
+  const e = env();
+  const from = e.TWILIO_PHONE_NUMBER;
+  if (!from) {
+    console.error("[twilio] TWILIO_PHONE_NUMBER not set");
+    return false;
   }
-
   const attempt = async (): Promise<boolean> => {
-    const response = await fetch(
-      `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
+    const res = await fetch(
+      `https://api.twilio.com/2010-04-01/Accounts/${e.TWILIO_ACCOUNT_SID}/Messages.json`,
       {
-        method: 'POST',
+        method: "POST",
         headers: {
-          'Content-Type':  'application/x-www-form-urlencoded',
-          Authorization:   'Basic ' + Buffer.from(`${accountSid}:${authToken}`).toString('base64'),
+          "Content-Type": "application/x-www-form-urlencoded",
+          Authorization:
+            "Basic " +
+            Buffer.from(`${e.TWILIO_ACCOUNT_SID}:${e.TWILIO_AUTH_TOKEN}`).toString("base64"),
         },
-        body: new URLSearchParams({ From: fromNumber, To: to, Body: body }).toString(),
-      }
-    )
-
-    if (!response.ok) {
-      const data = await response.json() as { message?: string; code?: number }
-      console.error('[twilio] Error:', data.message, 'code:', data.code)
-      return false
+        body: new URLSearchParams({ From: from, To: to, Body: body }).toString(),
+      },
+    );
+    if (!res.ok) {
+      const data = (await res.json()) as { message?: string; code?: number };
+      console.error("[twilio] error:", data.message, "code:", data.code);
+      return false;
     }
-
-    return true
-  }
-
+    return true;
+  };
   try {
-    return await attempt()
-  } catch (err: any) {
-    // Retry once on transient network errors
-    const isTransient = err?.cause?.code === 'ECONNRESET' ||
-                        err?.cause?.code === 'ECONNREFUSED' ||
-                        err?.cause?.code === 'ETIMEDOUT' ||
-                        err?.message?.includes('fetch failed')
-
-    if (isTransient) {
-      console.warn('[twilio] Transient error — retrying in 1s:', err?.cause?.code || err?.message)
-      await new Promise(r => setTimeout(r, 1000))
-      try {
-        return await attempt()
-      } catch (retryErr) {
-        console.error('[twilio] Retry failed:', retryErr)
-        return false
-      }
+    return await attempt();
+  } catch (err) {
+    const code = (err as { cause?: { code?: string } })?.cause?.code;
+    const transient =
+      code === "ECONNRESET" || code === "ECONNREFUSED" || code === "ETIMEDOUT" ||
+      (err as Error)?.message?.includes("fetch failed");
+    if (transient) {
+      await new Promise((r) => setTimeout(r, RETRY.smsTransientDelayMs));
+      try { return await attempt(); } catch { return false; }
     }
-
-    console.error('[twilio] Exception:', err)
-    return false
+    console.error("[twilio] exception:", err);
+    return false;
   }
 }
 
-// ─── SMS TEMPLATES ────────────────────────────────────────────────────────────
+// ---- timestamp formatting (clinic-local) ----
+function whenStr(iso: string, timezone: string): string {
+  const dt = new Date(iso);
+  const date = dt.toLocaleDateString("en-CA", {
+    weekday: "short", month: "short", day: "numeric", timeZone: timezone,
+  });
+  const time = dt.toLocaleTimeString("en-CA", {
+    hour: "numeric", minute: "2-digit", hour12: true, timeZone: timezone,
+  });
+  return `${date} at ${time}`;
+}
 
-export function smsConfirmation(
-  name: string,
-  service: string,
-  date: string,
-  time: string,
-  clinicName: string,
-  clinicPhone: string,
-  isNewPatient: boolean = false
-): string {
-  if (isNewPatient) {
-    return `Hi ${name}! Your ${service} at ${clinicName} is confirmed ✓
-
-${date} at ${time}
-
-Since it's your first visit, please bring:
-✓ Photo ID
-✓ Insurance card
-✓ List of current medications
-✓ Arrive 10 min early for paperwork
-
-Reply CONFIRM to confirm or CANCEL to cancel.
-Questions? Call ${clinicPhone} or text HELP.
-— ${clinicName}`
+// ---- templates (agentName + clinic values passed in; nothing hardcoded) ----
+export function smsConfirmation(p: {
+  name: string; service: string; startsAt: string; timezone: string;
+  clinicName: string; clinicPhone: string; isNewPatient: boolean;
+}): string {
+  const when = whenStr(p.startsAt, p.timezone);
+  if (p.isNewPatient) {
+    return `Hi ${p.name}! Your ${p.service} at ${p.clinicName} is confirmed for ${when}.
+Since it's your first visit, please bring photo ID, your insurance card, and a list of medications, and arrive 10 minutes early.
+Reply CONFIRM to confirm or CANCEL to cancel. Questions? Call ${p.clinicPhone}.`;
   }
-
-  // Existing patient — short with command hints
-  return `Hi ${name}, your ${service} at ${clinicName} is confirmed for ${date} at ${time}.
-
-Reply CONFIRM to confirm, CANCEL to cancel, or STATUS to view your appointments.
-Call ${clinicPhone} for help.`
+  return `Hi ${p.name}, your ${p.service} at ${p.clinicName} is confirmed for ${when}.
+Reply CONFIRM to confirm or CANCEL to cancel. Call ${p.clinicPhone} for help.`;
 }
 
-export function smsCancellation(
-  name: string,
-  service: string,
-  date: string,
-  time: string,
-  clinicName: string,
-  clinicPhone: string
-): string {
-  return `Hi ${name}, your ${service} on ${date} at ${time} at ${clinicName} has been cancelled.
-
-Call ${clinicPhone} to rebook or text WAITLIST ${service} to join the waitlist.`
+export function smsCancellation(p: {
+  name: string; service: string; startsAt: string; timezone: string;
+  clinicName: string; clinicPhone: string;
+}): string {
+  return `Hi ${p.name}, your ${p.service} on ${whenStr(p.startsAt, p.timezone)} at ${p.clinicName} has been cancelled.
+Call ${p.clinicPhone} to rebook or reply WAITLIST to be notified of openings.`;
 }
 
-export function smsReschedule(
-  name: string,
-  service: string,
-  date: string,
-  time: string,
-  clinicName: string,
-  clinicPhone: string
-): string {
-  return `Hi ${name}, your ${service} at ${clinicName} has been rescheduled to ${date} at ${time}.
-
-Reply CONFIRM to confirm or CANCEL to cancel. Questions? Call ${clinicPhone}.`
+export function smsReschedule(p: {
+  name: string; service: string; startsAt: string; timezone: string;
+  clinicName: string; clinicPhone: string;
+}): string {
+  return `Hi ${p.name}, your ${p.service} at ${p.clinicName} is now ${whenStr(p.startsAt, p.timezone)}.
+Reply CONFIRM to confirm or CANCEL to cancel. Questions? Call ${p.clinicPhone}.`;
 }
 
-export function smsReminder(
-  name: string,
-  service: string,
-  date: string,
-  time: string,
-  clinicName: string,
-  clinicPhone: string
-): string {
-  return `Hi ${name}, reminder: ${service} at ${clinicName} tomorrow ${date} at ${time}.
-
-Reply CONFIRM to confirm or CANCEL to cancel. Call ${clinicPhone} if needed.`
+export function smsOwnerWaitlistFilled(p: {
+  service: string; startsAt: string; timezone: string; patientName: string;
+}): string {
+  return `${BRAND.product} filled your ${p.service} slot on ${whenStr(p.startsAt, p.timezone)}. ${p.patientName} from the waitlist is now booked.`;
 }
 
-export function smsRecall(
-  name: string,
-  clinicName: string,
-  clinicPhone: string
-): string {
-  return `Hi ${name}, it has been 6 months since your last cleaning at ${clinicName}.
-
-Call ${clinicPhone} to book or reply YES. Reply STOP to opt out.`
+export function smsUrgentToOwner(p: {
+  patientName: string; phone: string; message: string; urgency: "urgent" | "emergency";
+}): string {
+  const mark = p.urgency === "emergency" ? "EMERGENCY" : "URGENT";
+  return `[${mark}] Message from ${p.patientName} (${p.phone}): ${p.message}. Please follow up.`;
 }
 
-export function smsReview(
-  name: string,
-  clinicName: string,
-  reviewLink: string
-): string {
-  return `Hi ${name}, thank you for visiting ${clinicName}! We hope everything went well.
-
-Leave us a quick review (30 seconds): ${reviewLink}`
+export function smsReview(p: {
+  name: string; clinicName: string; reviewLink: string;
+}): string {
+  return `Hi ${p.name}, thanks for visiting ${p.clinicName}! If you have 30 seconds, we'd love a quick review: ${p.reviewLink}`;
 }
 
-export function smsWelcome(
-  ownerName: string,
-  clinicName: string
-): string {
-  return `Welcome to Pearly Desk, ${ownerName}! ${clinicName} is all set up. Pearly is now answering your calls 24/7. Login at dashboard.pearlydesk.com`
+export function smsRecallFollowUp(p: {
+  name: string; clinicName: string; clinicPhone: string; step: number;
+}): string {
+  return `Hi ${p.name}, it's time for your check-up at ${p.clinicName}. We tried to reach you — call ${p.clinicPhone} or reply YES to book. Reply STOP to opt out.`;
 }
 
-export function smsPaymentFailed(clinicName: string): string {
-  return `Your Pearly Desk payment for ${clinicName} failed. Please update your payment method at pearlydesk.com/billing.`
+export function smsRecallFinal(p: {
+  name: string; clinicName: string; clinicPhone: string;
+}): string {
+  return `Hi ${p.name}, this is our last reminder that you're due for a visit at ${p.clinicName}. Call ${p.clinicPhone} whenever you're ready. Reply STOP to opt out.`;
 }
 
-export function smsUrgentMessage(
-  patientName: string,
-  phone: string,
-  message: string,
-  urgency: string
-): string {
-  const emoji = urgency === 'emergency' ? '🚨' : '⚠️'
-  return `${emoji} ${urgency.toUpperCase()}: Message from ${patientName} (${phone}): ${message}. Please follow up soon.`
+export function smsWaitlistBooked(p: {
+  service: string; startsAt: string; timezone: string; clinicName: string; clinicPhone: string;
+}): string {
+  return `You're booked! ${p.service} on ${whenStr(p.startsAt, p.timezone)} at ${p.clinicName}. See you then. Questions? Call ${p.clinicPhone}.`;
 }
 
-export function smsSmsReply(
-  clinicName: string,
-  clinicPhone: string
-): string {
-  return `Thanks for your message. Our team at ${clinicName} will follow up shortly. Need immediate help? Call ${clinicPhone}.`
+export function smsReminder(p: {
+  name: string; service: string; startsAt: string; timezone: string;
+  clinicName: string; clinicPhone: string;
+}): string {
+  return `Hi ${p.name}, a reminder of your ${p.service} at ${p.clinicName} ${whenStr(p.startsAt, p.timezone)}.
+Reply CONFIRM to confirm or CANCEL if you can't make it. Call ${p.clinicPhone} for help.`;
 }
 
-export function smsWaitlistOffer(
-  name: string,
-  service: string,
-  date: string,
-  time: string,
-  clinicName: string,
-  clinicPhone: string
-): string {
-  return `Hi ${name}, a slot just opened at ${clinicName}!
-
-${service} — ${date} at ${time}
-
-Reply YES to grab it or NO to skip. Slot may fill quickly. Call ${clinicPhone} if needed.`
+export function smsNoShow(p: {
+  name: string; service: string; clinicName: string; clinicPhone: string;
+}): string {
+  return `Hi ${p.name}, we missed you at ${p.clinicName} today for your ${p.service}. Hope everything's okay! Call ${p.clinicPhone} to rebook whenever you're ready.`;
 }
 
-export function smsFollowup(
-  name: string,
-  treatment: string,
-  clinicName: string,
-  clinicPhone: string
-): string {
-  return `Hi ${name}, following up on your recent ${treatment} at ${clinicName}. How are you feeling?
-
-Call ${clinicPhone} if you have any concerns — we are always here to help.`
+export function smsFollowupLight(p: {
+  name: string; service: string; clinicName: string; clinicPhone: string;
+}): string {
+  return `Hi ${p.name}, hope you're feeling great after your ${p.service} at ${p.clinicName}! Any questions, just call ${p.clinicPhone}. We're here for you.`;
 }
 
-export function smsBriefing(
-  clinicName: string,
-  bookingsToday: number,
-  overnightBookings: number,
-  unreadMessages: number
-): string {
-  const parts = []
-  parts.push(`Good morning — here is your ${clinicName} summary:`)
-  parts.push(`📅 ${bookingsToday} appointments today`)
-  if (overnightBookings > 0) {
-    parts.push(`🌙 Pearly booked ${overnightBookings} appointment${overnightBookings > 1 ? 's' : ''} overnight`)
-  }
-  if (unreadMessages > 0) {
-    parts.push(`💬 ${unreadMessages} unread message${unreadMessages > 1 ? 's' : ''} need attention`)
-  }
-  parts.push(`Login: dashboard.pearlydesk.com`)
-  return parts.join('\n')
+export function smsReappointment(p: {
+  name: string; clinicName: string; clinicPhone: string;
+}): string {
+  return `Hi ${p.name}, great seeing you at ${p.clinicName} yesterday! Looks like you didn't get to book your next visit — call ${p.clinicPhone} whenever you're ready.`;
 }
 
-export function smsRecallFollowUp(
-  name: string,
-  clinicName: string,
-  clinicPhone: string,
-  attemptNumber: number
-): string {
-  if (attemptNumber === 1) {
-    return `Hi ${name}, we tried calling you from ${clinicName} about your overdue cleaning.
-
-Call ${clinicPhone} or reply YES to book. Reply STOP to opt out.`
-  }
-  return `Hi ${name}, last reminder from ${clinicName} — it has been over 6 months since your last cleaning.
-
-Call ${clinicPhone} or reply YES to book. Reply STOP to opt out.`
+export function smsWaitlistOffer(p: {
+  name: string; service: string; startsAt: string; timezone: string;
+  clinicName: string; clinicPhone: string;
+}): string {
+  return `Hi ${p.name}, a ${p.service} opening just came up at ${p.clinicName} on ${whenStr(p.startsAt, p.timezone)}. Want it? Call ${p.clinicPhone} or reply YES — first to respond gets it.`;
 }
 
-export function smsRecallFinal(
-  name: string,
-  clinicName: string,
-  clinicPhone: string
-): string {
-  return `Hi ${name}, we miss you at ${clinicName}! When you are ready, call ${clinicPhone} — we are always happy to see you.
-
-Reply STOP to opt out.`
-}
-
-export function smsFollowupLight(
-  name: string,
-  service: string,
-  clinicName: string,
-  clinicPhone: string
-): string {
-  return `Hi ${name}, hope you are feeling great after your ${service} at ${clinicName}!
-
-Any questions or concerns? Call ${clinicPhone} — we are always happy to help.`
+export function smsWelcome(ownerName: string, clinicName: string): string {
+  return `Welcome to ${BRAND.product}, ${ownerName}! ${clinicName} is now live. Your AI receptionist is answering calls. Log in to your dashboard to configure hours, services, and your agent's name.`;
 }
