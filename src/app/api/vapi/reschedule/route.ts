@@ -93,6 +93,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         startsAt: result.starts_at, timezone: clinic.timezone,
         clinicName: clinic.name, clinicPhone,
       }),
+      clinic.twilio_phone ?? undefined,
     ).catch((e) => console.error("[reschedule] SMS error:", e));
 
     return vapiSay(

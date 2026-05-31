@@ -61,7 +61,7 @@ export async function runNoShow(opts: { force?: boolean } = {}): Promise<NoShowR
 
     sendSMS(appt.phone, smsNoShow({
       name: appt.patient_name, service: appt.service, clinicName: clinic.name, clinicPhone,
-    })).catch((e) => console.error("[noshow] SMS:", e));
+    }), clinic.twilio_phone ?? undefined).catch((e) => console.error("[noshow] SMS:", e));
 
     processed++;
     await new Promise((r) => setTimeout(r, 2000));

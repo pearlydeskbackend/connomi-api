@@ -39,13 +39,30 @@ export async function getClinicByPhone(phone: string): Promise<Clinic | null> {
   return null;
 }
 
+export async function getClinicByAssistant(assistantId: string): Promise<Clinic | null> {
+  const { data } = await db()
+    .from("clinics")
+    .select("*")
+    .eq("vapi_assistant_id", assistantId)
+    .eq("active", true)
+    .maybeSingle();
+  return (data as Clinic | null) ?? null;
+}
+
 export async function resolveClinic(
   clinicId: string | null,
   toNumber: string | null,
+  assistantId: string | null = null,
 ): Promise<Clinic | null> {
   if (clinicId) {
     const c = await getClinicById(clinicId);
     if (c) return c;
+  }
+  // Most reliable for per-clinic-assistant setups: match the assistant.
+  if (assistantId) {
+    const c = await getClinicByAssistant(assistantId);
+    if (c) return c;
+
   }
   if (toNumber) {
     const c = await getClinicByPhone(toNumber);
@@ -54,7 +71,7 @@ export async function resolveClinic(
   // last resort: if exactly one active clinic exists, it's that one
   const { data } = await db().from("clinics").select("*").eq("active", true);
   if (data && data.length === 1) return data[0];
-  console.error("[clinic] could not resolve clinic", { clinicId, toNumber });
+  console.error("[clinic] could not resolve clinic", { clinicId, toNumber, assistantId });
   return null;
 }
 

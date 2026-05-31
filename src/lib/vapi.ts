@@ -65,6 +65,7 @@ export interface ExtractedToolCall {
   args: Record<string, string>;
   clinicId: string | null;
   toNumber: string | null;
+  assistantId: string | null;
 }
 
 export function extractToolCall(body: Record<string, unknown>): ExtractedToolCall | null {
@@ -89,6 +90,14 @@ export function extractToolCall(body: Record<string, unknown>): ExtractedToolCal
     const metadata = call?.metadata as Record<string, string> | undefined;
     const clinicId = metadata?.clinic_id ?? null;
 
+    // Vapi ALWAYS sends the assistant id on a tool call. Since each clinic has
+    // its own assistant, this is the most reliable way to resolve the clinic.
+    const assistantId =
+      (call?.assistantId as string) ??
+      (call?.assistant_id as string) ??
+      ((call?.assistant as Record<string, unknown> | undefined)?.id as string) ??
+      null;
+
     const phoneObj = (call?.phoneNumber ?? call?.phone_number ?? call?.to) as
       | Record<string, unknown> | string | undefined;
     let toNumber: string | null = null;
@@ -104,6 +113,7 @@ export function extractToolCall(body: Record<string, unknown>): ExtractedToolCal
       args,
       clinicId,
       toNumber,
+      assistantId,
     };
   } catch (err) {
     console.error("[vapi] extractToolCall error:", err);

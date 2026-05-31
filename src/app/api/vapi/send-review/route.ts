@@ -32,7 +32,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       name: tool.args.patientName || "there",
       clinicName: clinic.name,
       reviewLink: clinic.google_review_link,
-    }));
+    }), clinic.twilio_phone ?? undefined);
 
     // stamp the most recent completed booking for this patient (best effort)
     const { data: booking } = await db()

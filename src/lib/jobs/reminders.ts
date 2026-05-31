@@ -49,7 +49,7 @@ export async function runReminders(opts: { force?: boolean } = {}): Promise<Remi
     const ok = await sendSMS(appt.phone, smsReminder({
       name: appt.patient_name, service: appt.service, startsAt: appt.starts_at,
       timezone: clinic.timezone, clinicName: clinic.name, clinicPhone,
-    }));
+    }), clinic.twilio_phone ?? undefined);
     if (ok) { sent++; await markContacted(clinic.id, appt.phone); }
 
     const highValue = HIGH_VALUE_SERVICES.some((s) => appt.service.toLowerCase().includes(s));

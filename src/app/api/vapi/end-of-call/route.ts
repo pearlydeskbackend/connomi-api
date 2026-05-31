@@ -112,7 +112,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 
     // alert owner on an unresolved call
     if (outcome === "unresolved" && clinic?.owner_phone && summary) {
-      sendSMS(clinic.owner_phone, `Connomi AI had trouble with a call. Summary: ${summary}. Check your dashboard.`)
+      sendSMS(clinic.owner_phone, `Connomi AI had trouble with a call. Summary: ${summary}. Check your dashboard.`, clinic.twilio_phone ?? undefined)
         .catch((e) => console.error("[end-of-call] owner SMS:", e));
     }
 
@@ -134,6 +134,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
           step >= 2
             ? smsRecallFinal({ name: p.name, clinicName: clinic.name, clinicPhone })
             : smsRecallFollowUp({ name: p.name, clinicName: clinic.name, clinicPhone, step: step + 1 }),
+          clinic.twilio_phone ?? undefined,
         );
         if (sent) {
           await db().from("patients")

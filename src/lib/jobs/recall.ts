@@ -96,11 +96,12 @@ export async function runRecall(opts: { force?: boolean; batchSize?: number } = 
           step >= 1
             ? smsRecallFinal({ name: patient.name, clinicName: clinic.name, clinicPhone })
             : smsRecallFollowUp({ name: patient.name, clinicName: clinic.name, clinicPhone, step: step + 1 }),
+          clinic.twilio_phone ?? undefined,
         );
         await markContacted(clinic.id, patient.phone);
       }
     } else {
-      ok = await sendSMS(patient.phone, smsRecallFinal({ name: patient.name, clinicName: clinic.name, clinicPhone }));
+      ok = await sendSMS(patient.phone, smsRecallFinal({ name: patient.name, clinicName: clinic.name, clinicPhone }), clinic.twilio_phone ?? undefined);
       if (ok) { smsOnly++; await markContacted(clinic.id, patient.phone); }
     }
 

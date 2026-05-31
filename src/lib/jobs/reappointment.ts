@@ -62,7 +62,7 @@ export async function runReappointment(opts: { force?: boolean } = {}): Promise<
       if (ok) {
         called++;
         await markContacted(clinic.id, appt.phone);
-        sendSMS(appt.phone, smsReappointment({ name: appt.patient_name, clinicName: clinic.name, clinicPhone }))
+        sendSMS(appt.phone, smsReappointment({ name: appt.patient_name, clinicName: clinic.name, clinicPhone }), clinic.twilio_phone ?? undefined)
           .catch((e) => console.error("[reappointment] SMS:", e));
         await markHandled();
       }

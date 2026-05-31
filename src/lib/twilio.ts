@@ -7,11 +7,13 @@
 import { env } from "@/config/env";
 import { RETRY, BRAND } from "@/config/app";
 
-export async function sendSMS(to: string, body: string): Promise<boolean> {
+export async function sendSMS(to: string, body: string, from?: string): Promise<boolean> {
   const e = env();
-  const from = e.TWILIO_PHONE_NUMBER;
-  if (!from) {
-    console.error("[twilio] TWILIO_PHONE_NUMBER not set");
+  // Per-clinic sender when provided, else the shared platform number.
+  // This is what makes sending scale: each clinic texts from its OWN number.
+  const sender = from || e.TWILIO_PHONE_NUMBER;
+  if (!sender) {
+    console.error("[twilio] no sender number (clinic.twilio_phone or TWILIO_PHONE_NUMBER)");
     return false;
   }
   const attempt = async (): Promise<boolean> => {
@@ -25,7 +27,7 @@ export async function sendSMS(to: string, body: string): Promise<boolean> {
             "Basic " +
             Buffer.from(`${e.TWILIO_ACCOUNT_SID}:${e.TWILIO_AUTH_TOKEN}`).toString("base64"),
         },
-        body: new URLSearchParams({ From: from, To: to, Body: body }).toString(),
+        body: new URLSearchParams({ From: sender, To: to, Body: body }).toString(),
       },
     );
     if (!res.ok) {

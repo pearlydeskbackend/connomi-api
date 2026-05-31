@@ -37,7 +37,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       const booking = await findNextBooking(clinic.id, phone);
       await sendSMS(from, booking
         ? `Your next appointment at ${clinic.name}: ${booking.service} on ${speakableSlot(booking.starts_at, clinic.timezone)}. Reply CANCEL to cancel.`
-        : `You have no upcoming appointments at ${clinic.name}. Reply BOOK or call ${clinicPhone}.`);
+        : `You have no upcoming appointments at ${clinic.name}. Reply BOOK or call ${clinicPhone}.`, clinic.twilio_phone ?? undefined);
       return xml();
     }
 
@@ -48,9 +48,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         await db().from("bookings")
           .update({ status: "confirmed", confirmed_at: new Date().toISOString() })
           .eq("id", booking.id);
-        await sendSMS(from, `Confirmed! See you ${speakableSlot(booking.starts_at, clinic.timezone)} at ${clinic.name}.`);
+        await sendSMS(from, `Confirmed! See you ${speakableSlot(booking.starts_at, clinic.timezone)} at ${clinic.name}.`, clinic.twilio_phone ?? undefined);
       } else {
-        await sendSMS(from, `Thanks! We look forward to seeing you. Call ${clinicPhone} with questions.`);
+        await sendSMS(from, `Thanks! We look forward to seeing you. Call ${clinicPhone} with questions.`, clinic.twilio_phone ?? undefined);
       }
       return xml();
     }
@@ -62,9 +62,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         await db().from("bookings")
           .update({ status: "cancelled", cancelled_at: new Date().toISOString() })
           .eq("id", booking.id);
-        await sendSMS(from, `Your ${booking.service} on ${speakableSlot(booking.starts_at, clinic.timezone)} at ${clinic.name} is cancelled. Call ${clinicPhone} to rebook.`);
+        await sendSMS(from, `Your ${booking.service} on ${speakableSlot(booking.starts_at, clinic.timezone)} at ${clinic.name} is cancelled. Call ${clinicPhone} to rebook.`, clinic.twilio_phone ?? undefined);
       } else {
-        await sendSMS(from, `No upcoming appointment found. Call ${clinicPhone} for help.`);
+        await sendSMS(from, `No upcoming appointment found. Call ${clinicPhone} for help.`, clinic.twilio_phone ?? undefined);
       }
       return xml();
     }
@@ -76,7 +76,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         .select("id, service").eq("clinic_id", clinic.id).eq("phone", phone)
         .in("status", ["waiting", "offered"]).is("deleted_at", null).maybeSingle();
       if (existing) {
-        await sendSMS(from, `You're already on the waitlist for ${existing.service} at ${clinic.name}. We'll reach out when a slot opens!`);
+        await sendSMS(from, `You're already on the waitlist for ${existing.service} at ${clinic.name}. We'll reach out when a slot opens!`, clinic.twilio_phone ?? undefined);
       } else {
         const { data: p } = await db().from("patients")
           .select("name").eq("clinic_id", clinic.id).eq("phone", phone).maybeSingle();
@@ -84,7 +84,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
           clinic_id: clinic.id, patient_name: p?.name || "Patient",
           phone, service, status: "waiting", priority: 5,
         });
-        await sendSMS(from, `You're on the waitlist for ${service} at ${clinic.name}! We'll reach out as soon as a slot opens. Reply REMOVE to leave.`);
+        await sendSMS(from, `You're on the waitlist for ${service} at ${clinic.name}! We'll reach out as soon as a slot opens. Reply REMOVE to leave.`, clinic.twilio_phone ?? undefined);
       }
       return xml();
     }
@@ -97,9 +97,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       if (entry) {
         await db().from("waitlist")
           .update({ status: "declined", deleted_at: new Date().toISOString() }).eq("id", entry.id);
-        await sendSMS(from, `Removed from the waitlist for ${entry.service} at ${clinic.name}. Call ${clinicPhone} when you're ready to book.`);
+        await sendSMS(from, `Removed from the waitlist for ${entry.service} at ${clinic.name}. Call ${clinicPhone} when you're ready to book.`, clinic.twilio_phone ?? undefined);
       } else {
-        await sendSMS(from, `You're not on the waitlist at ${clinic.name}.`);
+        await sendSMS(from, `You're not on the waitlist at ${clinic.name}.`, clinic.twilio_phone ?? undefined);
       }
       return xml();
     }
@@ -113,7 +113,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         .gte("attempted_at", since).order("attempted_at", { ascending: false })
         .limit(1).maybeSingle();
       if (!job || !job.slot_id) {
-        await sendSMS(from, `Thanks! If you're replying about an opening, please call ${clinicPhone} — we couldn't match it automatically.`);
+        await sendSMS(from, `Thanks! If you're replying about an opening, please call ${clinicPhone} — we couldn't match it automatically.`, clinic.twilio_phone ?? undefined);
         return xml();
       }
 
@@ -122,7 +122,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         .update({ status: "processing" }).eq("id", job.slot_id).eq("status", "open")
         .select("starts_at, service").maybeSingle();
       if (!claimed) {
-        await sendSMS(from, `Sorry — that slot was just taken. We'll keep you on the waitlist. — ${clinic.name}`);
+        await sendSMS(from, `Sorry — that slot was just taken. We'll keep you on the waitlist. — ${clinic.name}`, clinic.twilio_phone ?? undefined);
         return xml();
       }
 
@@ -139,7 +139,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       const result = (data as unknown as BookResult) ?? { ok: false, reason: "slot_taken" };
       if (error || !result.ok) {
         await db().from("cancelled_slots").update({ status: "open" }).eq("id", job.slot_id);
-        await sendSMS(from, `Sorry, we couldn't book that. Please call ${clinicPhone}.`);
+        await sendSMS(from, `Sorry, we couldn't book that. Please call ${clinicPhone}.`, clinic.twilio_phone ?? undefined);
         return xml();
       }
 
@@ -155,20 +155,20 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       await sendSMS(from, smsWaitlistBooked({
         service: claimed.service ?? job.service ?? "appointment",
         startsAt: claimed.starts_at, timezone: clinic.timezone, clinicName: clinic.name, clinicPhone,
-      }));
+      }), clinic.twilio_phone ?? undefined);
       const ownerPhone = clinic.owner_phone || clinic.twilio_phone;
       if (ownerPhone) {
         sendSMS(ownerPhone, smsOwnerWaitlistFilled({
           service: claimed.service ?? job.service ?? "appointment",
           startsAt: claimed.starts_at, timezone: clinic.timezone, patientName: job.patient_name,
-        })).catch(() => {});
+        }), clinic.twilio_phone ?? undefined).catch(() => {});
       }
       return xml();
     }
 
     // ---- HELP / fallback ----
     if (["help", "menu", "?"].includes(msg)) {
-      await sendSMS(from, `${clinic.name} commands:\nSTATUS - your appointments\nCONFIRM - confirm visit\nCANCEL - cancel\nWAITLIST [service] - join waitlist\nREMOVE - leave waitlist\nCall ${clinicPhone} for help.`);
+      await sendSMS(from, `${clinic.name} commands:\nSTATUS - your appointments\nCONFIRM - confirm visit\nCANCEL - cancel\nWAITLIST [service] - join waitlist\nREMOVE - leave waitlist\nCall ${clinicPhone} for help.`, clinic.twilio_phone ?? undefined);
     }
     return xml();
   } catch (err) {

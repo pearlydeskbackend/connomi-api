@@ -90,7 +90,7 @@ export async function runWaitlistCascade(): Promise<CascadeResult> {
       ok = await sendSMS(job.phone, smsWaitlistOffer({
         name: job.patient_name, service: job.service ?? "appointment",
         startsAt: slot.starts_at, timezone: tz, clinicName, clinicPhone,
-      }));
+      }), clinic?.twilio_phone ?? undefined);
       if (ok) {
         sms++;
         await db().from("waitlist_call_queue").update({ status: "called", outcome: "sms_sent" }).eq("id", job.id);

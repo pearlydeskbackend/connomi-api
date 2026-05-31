@@ -56,6 +56,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         startsAt: booking.starts_at, timezone: clinic.timezone,
         clinicName: clinic.name, clinicPhone,
       }),
+      clinic.twilio_phone ?? undefined,
     ).catch((e) => console.error("[cancel] SMS error:", e));
 
     // Open the slot for waitlist fill only if it's beyond the clinic's lead time.

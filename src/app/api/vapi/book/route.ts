@@ -86,6 +86,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         timezone: clinic.timezone, clinicName: clinic.name, clinicPhone,
         isNewPatient: v.isNewPatient,
       }),
+      clinic.twilio_phone ?? undefined,
     ).catch((e) => console.error("[book] SMS error:", e));
 
     // If this booking filled an open cancelled slot, close the waitlist loop

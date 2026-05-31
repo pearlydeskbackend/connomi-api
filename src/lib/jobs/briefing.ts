@@ -58,7 +58,7 @@ export async function runBriefing(): Promise<BriefingResult> {
     if ((ov?.waitlist_active ?? 0) > 0) lines.push(`${ov!.waitlist_active} on the waitlist.`);
     lines.push("", `— ${BRAND.product}`, dashboardUrl);
 
-    const ok = await sendSMS(clinic.owner_phone, lines.join("\n"));
+    const ok = await sendSMS(clinic.owner_phone, lines.join("\n"), clinic.twilio_phone ?? undefined);
     if (ok) sent++;
     await new Promise((r) => setTimeout(r, 500));
   }

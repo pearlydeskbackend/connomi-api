@@ -53,6 +53,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
           message,
           urgency,
         }),
+        clinic.twilio_phone ?? undefined,
       );
     }
 

@@ -92,14 +92,14 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       sendSMS(queueJob.phone, smsWaitlistBooked({
         service: claimed.service ?? queueJob.service ?? "appointment",
         startsAt: claimed.starts_at, timezone: clinic.timezone, clinicName: clinic.name, clinicPhone,
-      })).catch((e) => console.error("[waitlist-outcome] SMS:", e));
+      }), clinic.twilio_phone ?? undefined).catch((e) => console.error("[waitlist-outcome] SMS:", e));
 
       const ownerPhone = clinic.owner_phone || clinic.twilio_phone;
       if (ownerPhone) {
         sendSMS(ownerPhone, smsOwnerWaitlistFilled({
           service: claimed.service ?? queueJob.service ?? "appointment",
           startsAt: claimed.starts_at, timezone: clinic.timezone, patientName: queueJob.patient_name,
-        })).catch((e) => console.error("[waitlist-outcome] owner SMS:", e));
+        }), clinic.twilio_phone ?? undefined).catch((e) => console.error("[waitlist-outcome] owner SMS:", e));
       }
 
       return vapiSay(toolCallId, "booked");

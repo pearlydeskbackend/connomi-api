@@ -66,7 +66,7 @@ export async function runReviews(opts: { force?: boolean } = {}): Promise<Review
 
     const ok = await sendSMS(appt.phone, smsReview({
       name: appt.patient_name, clinicName: clinic.name, reviewLink: clinic.google_review_link,
-    }));
+    }), clinic.twilio_phone ?? undefined);
     if (ok) { sent++; await markContacted(clinic.id, appt.phone); }
     else failed++;
 

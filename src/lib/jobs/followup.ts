@@ -66,7 +66,7 @@ export async function runFollowup(opts: { force?: boolean } = {}): Promise<Follo
     } else {
       sent = await sendSMS(appt.phone, smsFollowupLight({
         name: appt.patient_name, service: appt.service, clinicName: clinic.name, clinicPhone,
-      }));
+      }), clinic.twilio_phone ?? undefined);
       if (sent) sms++;
     }
 
