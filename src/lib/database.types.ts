@@ -561,6 +561,22 @@ export interface Database {
         Args: { p_waitlist_id: string };
         Returns: undefined;
       };
+      score_waitlist_candidates: {
+        Args: { p_slot_id: string };
+        Returns: {
+          waitlist_id: string;
+          patient_name: string;
+          phone: string;
+          service: string | null;
+          score: number;
+          reliability: number;
+          preference: number;
+          wait_score: number;
+          value_score: number;
+          penalties: number;
+          rank_position: number;
+        }[];
+      };
     };
     Enums: {
       user_role: "owner" | "admin" | "staff";
