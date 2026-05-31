@@ -12,6 +12,22 @@ import { speakableSlot, offerAlternatives } from "@/lib/speech";
 
 export const dynamic = "force-dynamic";
 
+// Parse a spoken/written time into minutes-of-day (0-1439), or null if unparseable.
+// Handles: "10am", "10 AM", "10:00am", "10:00 AM", "2:30pm", "14:30", "9", "9:15".
+function parseTimeToMinutes(input: string): number | null {
+  if (!input) return null;
+  const s = input.trim().toLowerCase().replace(/\./g, ""); // "a.m." -> "am"
+  const m = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/);
+  if (!m) return null;
+  let hour = parseInt(m[1], 10);
+  const min = m[2] ? parseInt(m[2], 10) : 0;
+  const mer = m[3];
+  if (mer === "pm" && hour < 12) hour += 12;
+  if (mer === "am" && hour === 12) hour = 0;
+  if (hour > 23 || min > 59) return null;
+  return hour * 60 + min;
+}
+
 export async function POST(req: NextRequest): Promise<NextResponse> {
   let toolCallId = "unknown";
   try {
@@ -30,7 +46,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     };
     if (!requestedDate) return vapiSay(toolCallId, JSON.stringify({ available: true }));
 
-    const clinic = await resolveClinic(tool.clinicId, tool.toNumber);
+    const clinic = await resolveClinic(tool.clinicId, tool.toNumber, tool.assistantId);
     if (!clinic) {
       return vapiSay(toolCallId, JSON.stringify({ available: true, message: "proceed" }));
     }
@@ -50,15 +66,19 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 
     // If a specific time was requested, see if a slot starts then (clinic-local).
     if (requestedTime) {
+      // Normalize the requested time to 24h minutes-of-day, robustly.
+      const wantMinutes = parseTimeToMinutes(requestedTime);
       const match = open.find((s) => {
-        const local = new Date(s.starts_at).toLocaleTimeString("en-CA", {
-          hour: "numeric",
+        // slot start in clinic-local 24h "HH:MM"
+        const hhmm = new Date(s.starts_at).toLocaleTimeString("en-GB", {
+          hour: "2-digit",
           minute: "2-digit",
-          hour12: true,
+          hour12: false,
           timeZone: clinic.timezone,
         });
-        return local.replace(/\s/g, "").toLowerCase() ===
-          requestedTime.replace(/\s/g, "").toLowerCase();
+        const [h, m] = hhmm.split(":").map(Number);
+        const slotMinutes = h * 60 + m;
+        return wantMinutes !== null && slotMinutes === wantMinutes;
       });
       if (match) {
         return vapiSay(
