@@ -13,6 +13,7 @@ import { extractToolCall, vapiSay, checkRateLimit } from "@/lib/vapi";
 import { normalizePhone } from "@/lib/phone";
 import { BookingSchema } from "@/lib/validators";
 import { speakableSlot } from "@/lib/speech";
+import { anchorToTimezone, combineDateTime } from "@/lib/time-normalize";
 import { sendSMS, smsConfirmation, smsOwnerWaitlistFilled } from "@/lib/twilio";
 import type { BookResult } from "@/lib/booking-result";
 
@@ -29,7 +30,26 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     const rl = checkRateLimit(`book:${tool.toNumber ?? toolCallId}`);
     if (!rl.allowed) return vapiSay(toolCallId, "I'm having trouble right now. Please call us directly.");
 
-    const parsed = BookingSchema.safeParse(tool.args);
+    // Resolve the clinic FIRST — we need its timezone to anchor the time.
+    const clinic = await resolveClinic(tool.clinicId, tool.toNumber, tool.assistantId);
+    if (!clinic) return vapiSay(toolCallId, "I'm having trouble with our system. Please call us directly.");
+
+    // The voice agent sends `date` (YYYY-MM-DD) + `time` ("10:00 AM") per its
+    // prompt. Combine them and anchor to the clinic's timezone to get a correct
+    // startsAt. Also accept a pre-formed startsAt if one is sent.
+    const rawArgs = { ...(tool.args as Record<string, unknown>) };
+    const datePart = typeof rawArgs.date === "string" ? rawArgs.date : null;
+    const timePart = typeof rawArgs.time === "string" ? rawArgs.time : null;
+
+    if (!rawArgs.startsAt && datePart) {
+      const combined = combineDateTime(datePart, timePart, clinic.timezone);
+      if (combined) rawArgs.startsAt = combined;
+    } else if (typeof rawArgs.startsAt === "string") {
+      const anchored = anchorToTimezone(rawArgs.startsAt, clinic.timezone);
+      if (anchored) rawArgs.startsAt = anchored;
+    }
+
+    const parsed = BookingSchema.safeParse(rawArgs);
     if (!parsed.success) {
       return vapiSay(toolCallId, "I'm missing a detail. Could you give me your name, phone number, the service, and the date and time?");
     }
@@ -37,9 +57,6 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 
     const phone = normalizePhone(v.patientPhone);
     if (!phone) return vapiSay(toolCallId, "I couldn't read that phone number. Could you repeat it slowly?");
-
-    const clinic = await resolveClinic(tool.clinicId, tool.toNumber);
-    if (!clinic) return vapiSay(toolCallId, "I'm having trouble with our system. Please call us directly.");
 
     // Single atomic, race-safe call. Returns a typed result.
     const { data, error } = await db().rpc("book_appointment", {
@@ -61,6 +78,26 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     const result = data as unknown as BookResult;
 
     if (!result.ok) {
+      // IDEMPOTENCY: if the slot is "taken" by THIS SAME patient, it's a
+      // duplicate tool call (Vapi sometimes fires book twice) — the booking
+      // already succeeded. Treat it as success rather than confusing the
+      // caller with "that time was just taken."
+      if (result.reason === "slot_taken") {
+        const { data: existing } = await db()
+          .from("bookings")
+          .select("id, starts_at")
+          .eq("clinic_id", clinic.id)
+          .eq("phone", phone)
+          .eq("starts_at", v.startsAt)
+          .in("status", ["scheduled", "confirmed"])
+          .maybeSingle();
+        if (existing) {
+          return vapiSay(
+            toolCallId,
+            `You're all set — your ${v.service} is booked for ${speakableSlot(existing.starts_at, clinic.timezone)}. You'll get a confirmation text shortly. Anything else?`,
+          );
+        }
+      }
       // Map each typed failure reason to natural speech.
       switch (result.reason) {
         case "slot_taken":

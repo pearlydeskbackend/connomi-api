@@ -15,6 +15,7 @@ import { RescheduleSchema } from "@/lib/validators";
 import { findNextBooking } from "@/lib/lookup";
 import { sendSMS, smsReschedule } from "@/lib/twilio";
 import { speakableSlot } from "@/lib/speech";
+import { anchorToTimezone, combineDateTime } from "@/lib/time-normalize";
 import type { BookResult } from "@/lib/booking-result";
 
 export const dynamic = "force-dynamic";
@@ -30,14 +31,26 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     const rl = checkRateLimit(`resched:${tool.toNumber ?? toolCallId}`);
     if (!rl.allowed) return vapiSay(toolCallId, "I'm having trouble right now. Please call us directly.");
 
-    const parsed = RescheduleSchema.safeParse(tool.args);
+    const clinic = await resolveClinic(tool.clinicId, tool.toNumber, tool.assistantId);
+    if (!clinic) return vapiSay(toolCallId, "I'm having trouble with our system. Please call us directly.");
+
+    // Agent sends date + time; combine + anchor to clinic tz into newStartsAt.
+    const rawArgs = { ...(tool.args as Record<string, unknown>) };
+    const datePart = typeof rawArgs.date === "string" ? rawArgs.date : null;
+    const timePart = typeof rawArgs.time === "string" ? rawArgs.time : null;
+    if (!rawArgs.newStartsAt && datePart) {
+      const combined = combineDateTime(datePart, timePart, clinic.timezone);
+      if (combined) rawArgs.newStartsAt = combined;
+    } else if (typeof rawArgs.newStartsAt === "string") {
+      const anchored = anchorToTimezone(rawArgs.newStartsAt, clinic.timezone);
+      if (anchored) rawArgs.newStartsAt = anchored;
+    }
+
+    const parsed = RescheduleSchema.safeParse(rawArgs);
     if (!parsed.success) return vapiSay(toolCallId, "I need your phone number and the new date and time you'd like.");
 
     const phone = normalizePhone(parsed.data.patientPhone);
     if (!phone) return vapiSay(toolCallId, "I couldn't read that phone number. Could you repeat it?");
-
-    const clinic = await resolveClinic(tool.clinicId, tool.toNumber);
-    if (!clinic) return vapiSay(toolCallId, "I'm having trouble with our system. Please call us directly.");
 
     const existing = await findNextBooking(clinic.id, phone);
     if (!existing) {

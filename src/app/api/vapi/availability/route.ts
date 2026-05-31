@@ -39,11 +39,16 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     const rl = checkRateLimit(`avail:${tool.toNumber ?? toolCallId}`);
     if (!rl.allowed) return vapiSay(toolCallId, JSON.stringify({ available: true }));
 
-    const { requestedDate, requestedTime, service } = tool.args as {
-      requestedDate?: string;
-      requestedTime?: string;
+    const args = tool.args as {
+      date?: string; time?: string;
+      requestedDate?: string; requestedTime?: string;
       service?: string;
     };
+    // The assistant prompt sends `date` + `time`; accept those first, fall back
+    // to requestedDate/requestedTime for compatibility.
+    const requestedDate = args.date ?? args.requestedDate;
+    const requestedTime = args.time ?? args.requestedTime;
+    const service = args.service;
     if (!requestedDate) return vapiSay(toolCallId, JSON.stringify({ available: true }));
 
     const clinic = await resolveClinic(tool.clinicId, tool.toNumber, tool.assistantId);

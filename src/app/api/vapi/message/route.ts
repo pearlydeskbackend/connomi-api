@@ -31,7 +31,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 
     const { patientName, patientPhone, message, urgency } = parsed.data;
     const phone = normalizePhone(patientPhone ?? "");
-    const clinic = await resolveClinic(tool.clinicId, tool.toNumber);
+    const clinic = await resolveClinic(tool.clinicId, tool.toNumber, tool.assistantId);
     if (!clinic) return vapiSay(toolCallId, "I'm having trouble with our system. Please call us directly.");
 
     await db().from("messages").insert({

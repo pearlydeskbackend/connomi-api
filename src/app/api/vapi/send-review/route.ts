@@ -22,7 +22,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     const phone = normalizePhone(tool.args.patientPhone ?? "");
     if (!phone) return vapiSay(toolCallId, "I couldn't send that link. Please call us and we'll get it to you.");
 
-    const clinic = await resolveClinic(tool.clinicId, tool.toNumber);
+    const clinic = await resolveClinic(tool.clinicId, tool.toNumber, tool.assistantId);
     if (!clinic) return vapiSay(toolCallId, "I had trouble sending that. Please call us directly.");
     if (!clinic.google_review_link) {
       return vapiSay(toolCallId, "We don't have a review link set up yet, but thank you so much — it means a lot!");

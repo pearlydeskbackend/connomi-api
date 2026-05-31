@@ -25,7 +25,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     const { outcome, slotId } = tool.args as { outcome?: string; slotId?: string };
     if (!outcome || !slotId) return vapiSay(toolCallId, "Missing outcome or slot.");
 
-    const clinic = await resolveClinic(tool.clinicId, tool.toNumber);
+    const clinic = await resolveClinic(tool.clinicId, tool.toNumber, tool.assistantId);
     if (!clinic) return vapiSay(toolCallId, "Could not resolve clinic.");
 
     const now = new Date().toISOString();

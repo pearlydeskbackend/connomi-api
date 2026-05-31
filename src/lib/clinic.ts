@@ -62,7 +62,6 @@ export async function resolveClinic(
   if (assistantId) {
     const c = await getClinicByAssistant(assistantId);
     if (c) return c;
-
   }
   if (toNumber) {
     const c = await getClinicByPhone(toNumber);

@@ -20,7 +20,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     if (!tool) return vapiSay("unknown", "Perfect — we'll see you then!");
 
     const phone = normalizePhone(tool.args.patientPhone ?? "");
-    const clinic = await resolveClinic(tool.clinicId, tool.toNumber);
+    const clinic = await resolveClinic(tool.clinicId, tool.toNumber, tool.assistantId);
 
     if (phone && clinic) {
       const booking = await findNextBooking(clinic.id, phone);

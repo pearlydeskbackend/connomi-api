@@ -34,7 +34,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     const phone = normalizePhone(parsed.data.patientPhone);
     if (!phone) return vapiSay(toolCallId, "I couldn't read that phone number. Could you repeat it?");
 
-    const clinic = await resolveClinic(tool.clinicId, tool.toNumber);
+    const clinic = await resolveClinic(tool.clinicId, tool.toNumber, tool.assistantId);
     if (!clinic) return vapiSay(toolCallId, "I'm having trouble with our system. Please call us directly.");
 
     const booking = await findNextBooking(clinic.id, phone);
