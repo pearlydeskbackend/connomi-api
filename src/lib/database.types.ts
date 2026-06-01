@@ -101,6 +101,51 @@ export interface Database {
         Update: Partial<Database["public"]["Tables"]["users"]["Insert"]>;
         Relationships: [];
       };
+      leads: {
+        Row: {
+          id: string;
+          clinic_id: string | null;
+          name: string | null;
+          email: string | null;
+          phone: string | null;
+          idea: string | null;
+          business_name: string | null;
+          source: string;
+          status: string;
+          raw: Json | null;
+          created_at: string;
+          deleted_at: string | null;
+        };
+        Insert: {
+          id?: string;
+          clinic_id?: string | null;
+          name?: string | null;
+          email?: string | null;
+          phone?: string | null;
+          idea?: string | null;
+          business_name?: string | null;
+          source?: string;
+          status?: string;
+          raw?: Json | null;
+          created_at?: string;
+          deleted_at?: string | null;
+        };
+        Update: Partial<{
+          id: string;
+          clinic_id: string | null;
+          name: string | null;
+          email: string | null;
+          phone: string | null;
+          idea: string | null;
+          business_name: string | null;
+          source: string;
+          status: string;
+          raw: Json | null;
+          created_at: string;
+          deleted_at: string | null;
+        }>;
+        Relationships: [];
+      };
       providers: {
         Row: {
           id: string;

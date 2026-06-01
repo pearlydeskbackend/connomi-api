@@ -163,6 +163,7 @@ export async function triggerVapiCall(params: {
 // ---- clone a template Vapi assistant for a new clinic (onboarding) ----
 export async function cloneVapiAssistant(params: {
   templateAssistantId: string;
+  clinicId: string;
   clinicName: string;
   clinicPhone: string;
   clinicHours: string;
@@ -183,6 +184,14 @@ export async function cloneVapiAssistant(params: {
     // strip server-managed fields, keep the behavior config
     delete tpl.id; delete tpl.orgId; delete tpl.createdAt; delete tpl.updatedAt;
     tpl.name = `${params.clinicName} Receptionist`;
+
+    // CRITICAL: stamp the clinic_id into metadata so every tool call from this
+    // assistant resolves to the right clinic (this is what makes multi-clinic work).
+    tpl.metadata = {
+      ...(tpl.metadata as Record<string, unknown> | undefined),
+      clinic_id: params.clinicId,
+      clinic_name: params.clinicName,
+    };
 
     const createRes = await fetch("https://api.vapi.ai/assistant", {
       method: "POST",

@@ -1,9 +1,18 @@
 // ============================================================================
-// POST /api/onboarding/provision — admin-only clinic onboarding.
-// Creates the clinic, clones a Vapi assistant for it, and creates the owner's
-// auth user. NOTE: in v2 the handle_new_user DB trigger auto-creates the
-// public.users row from the auth user's metadata (clinic_id), so we do NOT
-// insert it here — doing so would duplicate. We pass clinic_id in metadata.
+// POST /api/onboarding/provision — admin-only, ONE-STEP clinic onboarding.
+//
+// Produces a clinic that is IMMEDIATELY bookable across all front doors
+// (phone, web form, web orb). It:
+//   1. creates the clinic (hours, timezone, open days, slot settings)
+//   2. ensures an embed_key (for the web booking form)
+//   3. adds at least one provider (no provider = no availability, ever)
+//   4. configures service durations (so availability + booking work)
+//   5. clones a Vapi assistant, STAMPED with clinic_id (so resolution works)
+//      and links it back on the clinic row
+//   6. creates the owner auth user (trigger makes the public.users row)
+//   7. sends a welcome SMS
+// Returns the embedKey + assistantId so you can drop them straight into the
+// website components.
 // ============================================================================
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/supabase";
@@ -12,84 +21,177 @@ import { cloneVapiAssistant } from "@/lib/vapi";
 
 export const dynamic = "force-dynamic";
 
+interface ProvisionBody {
+  clinicName: string;
+  ownerName?: string;
+  ownerEmail: string;
+  ownerPhone?: string;
+  twilioPhone?: string;            // the clinic's own SMS/voice number, if any
+  address?: string;
+  city?: string;
+  timezone?: string;               // default America/Vancouver
+  openTime?: string;               // "09:00"
+  closeTime?: string;              // "17:00"
+  openDays?: number[];             // [1..6] Mon-Sat
+  slotDurationMinutes?: number;    // default 30
+  googleReviewLink?: string;
+  plan?: string;
+  agentName?: string;              // default "Sophie"
+  providers?: { name: string; title?: string }[];  // at least one recommended
+  services?: { service: string; durationMinutes: number }[];
+  stripeCustomerId?: string;
+  stripeSubscriptionId?: string;
+}
+
+const DEFAULT_SERVICES = [
+  { service: "Teeth cleaning", durationMinutes: 30 },
+  { service: "Checkup", durationMinutes: 30 },
+  { service: "Filling", durationMinutes: 45 },
+  { service: "Crown", durationMinutes: 90 },
+  { service: "Root canal", durationMinutes: 90 },
+  { service: "Consultation", durationMinutes: 30 },
+];
+
 export async function POST(req: NextRequest): Promise<NextResponse> {
   if (req.headers.get("x-admin-secret") !== process.env.ADMIN_SECRET) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  let body: ProvisionBody;
   try {
-    const body = (await req.json()) as Record<string, string>;
-    const { clinicName, ownerName, ownerEmail, ownerPhone, address, city,
-            googleReviewLink, stripeCustomerId, stripeSubscriptionId, plan, agentName } = body;
+    body = (await req.json()) as ProvisionBody;
+  } catch {
+    return NextResponse.json({ error: "invalid_json" }, { status: 400 });
+  }
 
-    if (!clinicName || !ownerEmail) {
-      return NextResponse.json({ error: "clinicName and ownerEmail required" }, { status: 400 });
-    }
+  const { clinicName, ownerEmail } = body;
+  if (!clinicName || !ownerEmail) {
+    return NextResponse.json({ error: "clinicName and ownerEmail required" }, { status: 400 });
+  }
 
-    // 1) create the clinic
-    const { data: clinic, error: clinicErr } = await db()
+  const supabase = db();
+  // track what we create so we can roll back on failure
+  let clinicId: string | null = null;
+
+  try {
+    // ---- 1) create the clinic, fully configured so it's bookable ----
+    const { data: clinic, error: clinicErr } = await supabase
       .from("clinics")
       .insert({
         name: clinicName,
-        owner_name: ownerName ?? null,
+        owner_name: body.ownerName ?? null,
         owner_email: ownerEmail,
-        owner_phone: ownerPhone ?? null,
-        plan: plan || "starter",
+        owner_phone: body.ownerPhone ?? null,
+        timezone: body.timezone || "America/Vancouver",
+        open_time: body.openTime || "09:00",
+        close_time: body.closeTime || "17:00",
+        open_days: body.openDays && body.openDays.length ? body.openDays : [1, 2, 3, 4, 5, 6],
+        slot_duration_minutes: body.slotDurationMinutes || 30,
+        plan: body.plan || "starter",
         active: true,
-        agent_name: agentName || "Sophie",
+        agent_name: body.agentName || "Sophie",
       })
       .select("*")
       .single();
+
     if (clinicErr || !clinic) {
+      console.error("[provision] clinic create failed:", clinicErr);
       return NextResponse.json({ error: "Failed to create clinic" }, { status: 500 });
     }
+    clinicId = clinic.id;
 
-    // optional fields not in the strict Insert type — set in a follow-up update
-    await db().from("clinics").update({
-      city: city ?? null,
-      google_review_link: googleReviewLink ?? null,
-      stripe_customer_id: stripeCustomerId ?? null,
-      stripe_subscription_id: stripeSubscriptionId ?? null,
+    // optional fields set in a follow-up update (not in strict Insert type)
+    await supabase.from("clinics").update({
+      twilio_phone: body.twilioPhone ?? null,
+      city: body.city ?? null,
+      google_review_link: body.googleReviewLink ?? null,
+      stripe_customer_id: body.stripeCustomerId ?? null,
+      stripe_subscription_id: body.stripeSubscriptionId ?? null,
     }).eq("id", clinic.id);
 
-    // 2) clone a Vapi assistant for this clinic
+    // embed_key is auto-generated by the DB default; read it back
+    const { data: keyed } = await supabase
+      .from("clinics").select("embed_key").eq("id", clinic.id).single();
+    const embedKey = keyed?.embed_key ?? null;
+
+    // ---- 2) providers (at least one, or there is no availability) ----
+    const providers = body.providers && body.providers.length
+      ? body.providers
+      : [{ name: "Smith", title: "Dr." }];
+    await supabase.from("providers").insert(
+      providers.map((p) => ({
+        clinic_id: clinic.id,
+        name: p.name,
+        title: p.title ?? "Dr.",
+        active: true,
+      })),
+    );
+
+    // ---- 3) service durations (availability + booking depend on these) ----
+    const services = body.services && body.services.length ? body.services : DEFAULT_SERVICES;
+    await supabase.from("service_durations").insert(
+      services.map((s) => ({
+        clinic_id: clinic.id,
+        service: s.service,
+        duration_minutes: s.durationMinutes,
+      })),
+    );
+
+    // ---- 4) clone a Vapi assistant, stamped with clinic_id ----
     const templateId = process.env.VAPI_TEMPLATE_ASSISTANT_ID;
     let vapiAssistantId: string | null = null;
     if (templateId) {
       vapiAssistantId = await cloneVapiAssistant({
         templateAssistantId: templateId,
+        clinicId: clinic.id,
         clinicName,
-        clinicPhone: ownerPhone || "",
-        clinicHours: "",
-        clinicDentists: "",
-        clinicAddress: address ? `${address}, ${city ?? ""}` : city ?? "",
+        clinicPhone: body.twilioPhone || body.ownerPhone || "",
+        clinicHours: `${body.openTime || "09:00"}–${body.closeTime || "17:00"}`,
+        clinicDentists: providers.map((p) => `${p.title ?? "Dr."} ${p.name}`).join(", "),
+        clinicAddress: body.address ? `${body.address}, ${body.city ?? ""}` : body.city ?? "",
       });
       if (vapiAssistantId) {
-        await db().from("clinics").update({ vapi_assistant_id: vapiAssistantId }).eq("id", clinic.id);
+        await supabase.from("clinics").update({ vapi_assistant_id: vapiAssistantId }).eq("id", clinic.id);
       }
     }
 
-    // 3) create the owner auth user; the handle_new_user trigger creates the
-    //    public.users row from this metadata (clinic_id) — we don't insert it.
+    // ---- 5) owner auth user (trigger creates public.users from metadata) ----
     const tempPassword = Array.from({ length: 16 }, () =>
       "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789".charAt(Math.floor(Math.random() * 54)),
     ).join("");
-
-    await db().auth.admin.createUser({
+    await supabase.auth.admin.createUser({
       email: ownerEmail,
       password: tempPassword,
       email_confirm: true,
-      user_metadata: { clinic_id: clinic.id, clinic_name: clinicName, full_name: ownerName },
+      user_metadata: { clinic_id: clinic.id, clinic_name: clinicName, full_name: body.ownerName },
     });
 
-    // 4) welcome SMS
-    if (ownerPhone) {
-      await sendSMS(ownerPhone, smsWelcome(ownerName || "there", clinicName)).catch(() => {});
+    // ---- 6) welcome SMS ----
+    if (body.ownerPhone) {
+      await sendSMS(body.ownerPhone, smsWelcome(body.ownerName || "there", clinicName)).catch(() => {});
     }
 
-    return NextResponse.json({ success: true, clinicId: clinic.id, vapiAssistantId });
+    // everything the website components need, returned in one place
+    return NextResponse.json({
+      success: true,
+      clinicId: clinic.id,
+      embedKey,
+      vapiAssistantId,
+      bookable: Boolean(embedKey && vapiAssistantId),
+      next: {
+        bookingForm: { apiUrl: "https://connomi-api.vercel.app", embedKey },
+        bookingOrb: { assistantId: vapiAssistantId },
+        reminder: "Add the clinic's domain to Vapi allowed origins for the orb.",
+      },
+    });
   } catch (err) {
     console.error("[provision] error:", err);
+    // best-effort rollback of the clinic (cascades to providers/services via FK)
+    if (clinicId) {
+      try {
+        await supabase.from("clinics").update({ active: false }).eq("id", clinicId);
+      } catch { /* best effort */ }
+    }
     return NextResponse.json({ error: "Provisioning failed" }, { status: 500 });
   }
 }
