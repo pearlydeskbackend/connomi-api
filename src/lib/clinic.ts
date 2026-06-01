@@ -75,6 +75,17 @@ export async function resolveClinic(
 }
 
 /** the name this clinic's receptionist introduces herself with */
+export async function getClinicByEmbedKey(embedKey: string): Promise<Clinic | null> {
+  if (!embedKey || !embedKey.startsWith("emb_")) return null;
+  const { data } = await db()
+    .from("clinics")
+    .select("*")
+    .eq("embed_key", embedKey)
+    .eq("active", true)
+    .maybeSingle();
+  return (data as Clinic | null) ?? null;
+}
+
 export function agentNameFor(clinic: Clinic): string {
   return clinic.agent_name?.trim() || BRAND.agentName;
 }

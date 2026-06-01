@@ -46,6 +46,7 @@ export interface Database {
           ical_last_synced_at: string | null;
           plan: string;
           active: boolean;
+          embed_key: string | null;
           created_at: string;
           updated_at: string;
         };
@@ -79,6 +80,7 @@ export interface Database {
           ical_last_synced_at?: string | null;
           close_time?: string;
           holidays?: string[];
+          embed_key?: string | null;
         };
         Relationships: [];
       };
